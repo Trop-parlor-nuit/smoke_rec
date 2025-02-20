@@ -157,7 +157,7 @@ def save_video(frames: torch.Tensor, filename: str, fps: int = 20, apply_gamma =
     # rgba[..., 3] = 1.0
     kwargs = {}
     if filename.endswith('.webp'):
-        kwargs.update(quality=100)
+        kwargs.update(quality=100, loop=0)
     rdv.save_video(frames, filename, fps, **kwargs)
 
 

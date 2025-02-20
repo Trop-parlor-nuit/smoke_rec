@@ -1,5 +1,62 @@
-# Cloudy
 
-![](./images/generated_example_2.webp)
+<!--![](./images/generated_example_2.webp)-->
 
+<table>
+<tr>
+<td style="width: 512px">
+<img src="./images/generated_example_2.webp"/>
+</td>
+<td>
+<h1> Cloudy </h1>
 Official implementation of the paper "Light Transport-aware Diffusion Posterior Sampling for Single View Reconstruction of Volumes"
+</td>
+</tr>
+</table>
+
+
+## Led by Example
+
+<table>
+<tr>
+<td style="width: 256px">
+<img src="./images/example_generation.webp"/>
+</td>
+<td>
+Setting up the pipeline, generating a cloud and rendering.
+</td>
+</tr>
+
+<tr>
+<td style="width: 256px">
+<img src="./images/generated_example_2.webp"/>
+</td>
+<td>
+Volume super resolution.
+</td>
+</tr>
+
+<tr>
+<td style="width: 256px">
+<img src="./images/generated_example_2.webp"/>
+</td>
+<td>
+Volume inpainting.
+</td>
+</tr>
+
+
+<tr>
+<td>
+<img src="./images/generated_example_2.webp"/>
+</td>
+<td>
+Single view reconstruction.
+</td>
+</tr>
+</table>
+
+
+
+
+
+

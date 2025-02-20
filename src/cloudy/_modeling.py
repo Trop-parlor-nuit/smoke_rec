@@ -1544,31 +1544,23 @@ class GaussianDiffuser2D(torch.nn.Module):
         # x_t = torch.clamp(x_t, -1.0, 1.0)
         return x_t
 
-    def reverse_diffusion_DDIM(self, x_t: torch.Tensor, t: typing.Optional[int] = None, steps: typing.Optional[int] = None, eta: float = 0.5, steps_rate: int = 1):
+    def reverse_diffusion_DDIM(self,
+                               x_t: torch.Tensor,
+                               t: typing.Optional[int] = None,
+                               steps: typing.Optional[int] = None,
+                               eta: float = 1.0,
+                               samples: int = 1000,
+                               callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                               ):
         if t is None:
             t = self.timesteps-1  # Assumed to be the noise
         if steps is None:
             steps = t  # Assumed to be all steps to 0.
         assert steps <= t
-        TOTAL = max(1, steps // steps_rate)
-        FINAL = self.timesteps * 1 // 100
-        x = np.arange(.0, (t + 1) / self.timesteps + 0.000001, steps_rate / self.timesteps)
-        x = ((x**0.5)*(self.timesteps - 1)).astype(np.int32)
-        # x = np.arange(1.0, 1.0 - 2 * (t+1)/self.timesteps - 0.0001, -2 * steps_rate / self.timesteps)
-        # x = (((np.arccos(np.clip(x, -1.0, 1.0))/np.pi)**0.9) * (self.timesteps-1)).astype(np.int32)
-        # tt = [-1] + list((((np.arange(0, t, steps_rate)/t)**0.6)*t).astype(np.int32))+[t]
+        x = np.arange((t - steps)/self.timesteps, (t + 1) / self.timesteps + 0.000001, 1.0 / samples)
+        x = (((x**0.5))*(self.timesteps - 1)).astype(np.int32)
         tt = [-1] + list(x)
         tt.reverse()
-        # if TOTAL <= FINAL:
-        #     tt = list(range(-1, t + 1))
-        #     tt.reverse()
-        # else:
-        #     # tt = list(int(i) for i in torch.arange(0, t, t/TOTAL).long())
-        #     # tt.reverse()
-        #     # tt = [t] + tt + [-1]
-        #     tt = list(int(i) for i in torch.arange(FINAL, t, (t - FINAL) / (TOTAL - FINAL)).long())
-        #     tt.reverse()
-        #     tt = [t] + tt + list(range(FINAL - 1, -2, -1))
         iterations = tqdm(range(len(tt) - 1), 'Unconditional sampling DDIM')
         for i in iterations:
             current_i = tt[i]
@@ -1580,6 +1572,8 @@ class GaussianDiffuser2D(torch.nn.Module):
             x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
             # x0_hat = np.sqrt(1 / max(alpha_hat, 0.001)) * x_t - np.sqrt(max(0.0, 1 / alpha_hat - 1)) * e
             x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
+            if callback is not None:
+                callback(current_i + 1, x0_hat)
             # x0_hat *= 1.0 / max(1.0, x0_hat.abs().max().item() * 0.4)
             sigma = eta *  np.sqrt ((1 - alpha_hat/alpha_prev_hat) * (1 - alpha_prev_hat) / (1 - alpha_hat))
             c = np.sqrt(1 - alpha_prev_hat - sigma ** 2)
@@ -1587,6 +1581,8 @@ class GaussianDiffuser2D(torch.nn.Module):
             x_t = np.sqrt(alpha_prev_hat) * x0_hat + c * e
             x_t = x_t + sigma * z
         # x_t = torch.clamp(x_t, -1.0, 1.0)
+        if callback is not None:
+            callback(0, x_t)
         return x_t
 
     def forward_diffusion(self, x_k: torch.Tensor, k: typing.Optional[int] = None, steps: typing.Optional[int] = None, noise: torch.Tensor = None):

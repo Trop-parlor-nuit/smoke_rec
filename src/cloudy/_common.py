@@ -722,7 +722,7 @@ class Pipeline:
         zip_path = self.workplace + "/pretrained.zip"
         # Download the ZIP file
         print(f"Downloading file from Google Drive: {url}")
-        gdown.download(id="1UTf-S8sM6m8t5IuCsbyvdZuuFs7cs9LE", output=zip_path, quiet=False)
+        gdown.download(id="1sc_UWXun6EuCTk5OUwkBzzUJf6_LVa6f", output=zip_path, quiet=False)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(self.workplace)
         # Optionally, remove the ZIP file after extraction
@@ -1193,16 +1193,24 @@ class Pipeline:
         else:
             raise NotImplemented()
 
-    def denoise(self, noise: torch.Tensor, t: int, *, steps_rate: int = 1, eta: float = 1.0):
+    def denoise(self,
+                noise: torch.Tensor,
+                t: int, *,
+                samples: int = 1000,
+                eta: float = 1.0,
+                callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                ):
         diffuser, _ = self.get_diffuser()
         with torch.no_grad():
             if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
                 if len(noise.shape) == 3:  # no batch
                     # return diffuser.eval_generator(noise.unsqueeze(0), t)[0]
-                    return diffuser.reverse_diffusion_DDIM(noise.unsqueeze(0), t, eta=eta, steps_rate=steps_rate)[0]
+                    def wrap_callback(i, l):
+                        callback(i, l[0])
+                    return diffuser.reverse_diffusion_DDIM(noise.unsqueeze(0), t, eta=eta, samples=samples, callback=wrap_callback if callback is not None else None)[0]
                 if len(noise.shape) == 4:  # batch
                     # return diffuser.eval_generator(noise, t)
-                    return diffuser.reverse_diffusion_DDIM(noise, t, eta=eta, steps_rate=steps_rate)
+                    return diffuser.reverse_diffusion_DDIM(noise, t, eta=eta, samples=samples, callback=callback)
                 raise Exception()
             else:
                 raise NotImplemented()
@@ -1218,17 +1226,41 @@ class Pipeline:
         else:
             raise NotImplemented()
 
-    def generate_normalized_latent(self, start_noise: typing.Optional[torch.Tensor] = None, batch_size: typing.Optional[int] = None, *, steps_rate: int = 1, eta: float = 1.0):
+    def generate_normalized_latent(self,
+                                   start_noise: typing.Optional[torch.Tensor] = None,
+                                   batch_size: typing.Optional[int] = None, *,
+                                   samples: int = 1000,
+                                   eta: float = 1.0,
+                                   callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                                   ):
         assert start_noise is None or batch_size is None or start_noise.shape[0] == batch_size
         if start_noise is None:
             start_noise = self.random_gaussian_latent(batch_size=batch_size)
         diffuser, _ = self.get_diffuser()
         diffuser.eval()
-        return self.denoise(start_noise, diffuser.timesteps - 1, steps_rate=steps_rate, eta=eta)
+        return self.denoise(
+            start_noise,
+            diffuser.timesteps - 1,
+            samples=samples,
+            eta=eta,
+            callback=callback
+        )
 
-    def generate_latent(self, batch_size: typing.Optional[int] = None, steps_rate: int = 1, eta: float = 1.0):
-        latent = self.generate_normalized_latent(batch_size, steps_rate=steps_rate, eta=eta)
-        # zero_features = (latent[:, 0, 0] + latent[:, 0, 127] + latent[:, 127, 0] + latent[:, 127, 127])/4
-        # latent -= zero_features.view(-1, 1, 1)
+    def generate_latent(self,
+                        start_noise: typing.Optional[torch.Tensor] = None,
+                        batch_size: typing.Optional[int] = None, *,
+                        samples: int = 1000,
+                        eta: float = 1.0,
+                        callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+        ):
+        def wrap_callback(i, l):
+            callback(i, self.denormalize_latent(l))
+        latent = self.generate_normalized_latent(
+            start_noise=start_noise,
+            batch_size=batch_size,
+            samples=samples,
+            eta=eta,
+            callback=wrap_callback if callback is not None else None
+        )
         return self.denormalize_latent(latent)
 
