@@ -28,7 +28,7 @@ Setting up the pipeline, generating a cloud and rendering.
 
 <tr>
 <td style="width: 256px">
-<img src="./images/generated_example_2.webp"/>
+<img src="./images/generated_cloud_super_resolution.webp"/>
 </td>
 <td>
 Volume super resolution.
@@ -37,7 +37,7 @@ Volume super resolution.
 
 <tr>
 <td style="width: 256px">
-<img src="./images/generated_example_2.webp"/>
+<img src="./images/generated_cloud_inpainting.webp"/>
 </td>
 <td>
 Volume inpainting.
@@ -46,7 +46,7 @@ Volume inpainting.
 
 
 <tr>
-<td>
+<td style="width: 256px">
 <img src="./images/generated_example_2.webp"/>
 </td>
 <td>
