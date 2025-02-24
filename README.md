@@ -25,7 +25,6 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 Setting up the pipeline, generating a cloud and rendering.
 </td>
 </tr>
-
 <tr>
 <td>
 <img style="width: 256px" src="./images/generated_cloud_super_resolution.webp"/>
@@ -34,7 +33,6 @@ Setting up the pipeline, generating a cloud and rendering.
 Cloud super resolution.
 </td>
 </tr>
-
 <tr>
 <td>
 <img style="width: 256px" src="./images/generated_cloud_inpainting.webp"/>
@@ -43,11 +41,9 @@ Cloud super resolution.
 Cloud inpainting.
 </td>
 </tr>
-
-
 <tr>
-<td>
-<img style="min-width: 256px" src="./images/generated_example_2.webp"/>
+<td style="width: 256px">
+<img style="width: 256px" src="./images/generated_example_2.webp"/>
 </td>
 <td>
 Single view reconstruction.
