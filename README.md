@@ -31,7 +31,7 @@ Setting up the pipeline, generating a cloud and rendering.
 <img src="./images/generated_cloud_super_resolution.webp"/>
 </td>
 <td>
-Volume super resolution.
+Cloud super resolution.
 </td>
 </tr>
 
@@ -40,7 +40,7 @@ Volume super resolution.
 <img src="./images/generated_cloud_inpainting.webp"/>
 </td>
 <td>
-Volume inpainting.
+Cloud inpainting.
 </td>
 </tr>
 
