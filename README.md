@@ -43,7 +43,7 @@ Cloud inpainting.
 </tr>
 <tr>
 <td style="width: 256px">
-<img style="width: 256px" src="./images/generated_example_2.webp"/>
+<img style="width: 256px" src="./images/generated_cloud_single_view.webp"/>
 </td>
 <td>
 Single view reconstruction.
