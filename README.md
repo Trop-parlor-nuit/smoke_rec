@@ -23,7 +23,7 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </td>
 <td>
 Setting up the pipeline, generating a cloud and rendering.
-<a href="https://colab.research.google.com/github/rendervous/rendervous_project/blob/main/tutorials/e03_basic_mlp.ipynb">open in colab</a>
+<a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
 </td>
 </tr>
 <tr>
