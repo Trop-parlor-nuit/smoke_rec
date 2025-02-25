@@ -1546,25 +1546,22 @@ class GaussianDiffuser2D(torch.nn.Module):
 
     def reverse_diffusion_DDIM(self,
                                x_t: torch.Tensor,
-                               t: typing.Optional[int] = None,
-                               steps: typing.Optional[int] = None,
+                               steps: typing.Optional[typing.List[int]] = None,
                                eta: float = 1.0,
-                               samples: int = 1000,
                                callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
                                ):
-        if t is None:
-            t = self.timesteps-1  # Assumed to be the noise
         if steps is None:
-            steps = t  # Assumed to be all steps to 0.
-        assert steps <= t
-        x = np.arange((t - steps)/self.timesteps, (t + 1) / self.timesteps + 0.000001, 1.0 / samples)
-        x = (((x**0.5))*(self.timesteps - 1)).astype(np.int32)
-        tt = [-1] + list(x)
-        tt.reverse()
-        iterations = tqdm(range(len(tt) - 1), 'Unconditional sampling DDIM')
+            steps = list(range(0, self.timesteps+1))
+            steps.reverse()
+        assert all(i == 0 or steps[i] <= steps[i-1] for i in range(len(steps))), "Steps has to be non-increasing sequence"
+        assert all(s <= self.timesteps for s in steps), f"All steps should be in range 0..{self.timesteps}"
+        steps = list(set(steps))  # remove duplicates and add special index
+        steps.sort()
+        steps.reverse()
+        iterations = tqdm(range(len(steps)-1), 'Unconditional sampling DDIM')
         for i in iterations:
-            current_i = tt[i]
-            next_i = tt[i + 1]
+            current_i = steps[i] - 1
+            next_i = steps[i + 1] - 1
             alpha_hat = max(0.0, self.alpha_hat[current_i])
             alpha_prev_hat = max(0.0, self.alpha_hat[next_i]) if next_i >= 0 else 1.0
             ## Computing x_{t-1} ##
@@ -1602,70 +1599,66 @@ class GaussianDiffuser2D(torch.nn.Module):
         return x_k * np.sqrt(alpha_cum) + np.sqrt(1 - alpha_cum)*noise
 
     def estimate_x0(self, x_t: torch.Tensor, t: int):
-        alpha_hat = self.alpha_hat[t]
-        e = self.predict_noise(x_t, t)
-        x0_hat = np.sqrt(1 / (alpha_hat + 0.001)) * x_t - np.sqrt(1 / (alpha_hat+0.001) - 1) * e
+        if t == 0:
+            return x_t  # nothing to denoise
+        alpha_hat = self.alpha_hat[t-1]
+        e = self.predict_noise(x_t, t-1)
+        x0_hat = np.sqrt(1 / max(0.000001, alpha_hat)) * x_t - np.sqrt(1 / max(0.000001, alpha_hat) - 1) * e
         return torch.clamp(x0_hat, -1.0, 1.0)
 
     def posterior_sampling_DPS_DDIM(self,
                                 x_t: torch.Tensor,
-                                t: int,
+                                steps: typing.List[int],
                                 eta: float = 1.0,
                                 weight: float = 1.0,
-                                steps: int = 100,
-                                criteria: typing.Optional[typing.Callable[[torch.Tensor], torch.Tensor]] = None):
-        # t = self.timesteps  # Assumed to be the noise
-        TOTAL = steps
-        FINAL = 40
-        if t <= TOTAL:
-            tt = list(range(-1, t))
-            tt.reverse()
-        else:
-            # tt = list(int(i) for i in torch.arange(0, t, t/TOTAL).long())
-            # tt.reverse()
-            # tt = [t] + tt + [-1]
-            tt = list(int(i) for i in torch.arange(FINAL, t - 1, (t - FINAL)/(TOTAL - FINAL)).long())
-            tt.reverse()
-            tt = [t - 1] + tt + list(range(FINAL - 1, -2, -1))
-        iterations = tqdm(range(len(tt)-1), 'Posterior sampling DPS_DDIM')
-        ema_grad_xt = None
+                                criteria: typing.Optional[typing.Callable[[torch.Tensor], torch.Tensor]] = None,
+                                callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None):
+        if steps is None:
+            steps = list(range(0, self.timesteps+1))
+            steps.reverse()
+        assert all(i == 0 or steps[i] <= steps[i-1] for i in range(len(steps))), "Steps has to be non-increasing sequence"
+        assert all(s <= self.timesteps for s in steps), f"All steps should be in range 0..{self.timesteps}"
+        x_t = x_t.unsqueeze(0).detach()  # add batch dimension required by diffuser
+        steps = list(set(steps))  # remove duplicates and add special index
+        steps.sort()
+        steps.reverse()
+        iterations = tqdm(range(len(steps)-1), 'Posterior sampling DPS_DDIM')
         for i in iterations:
-            current_i = tt[i]
-            next_i = tt[i+1]
+            current_i = steps[i] - 1
+            next_i = steps[i+1] - 1
             alpha_hat = self.alpha_hat[current_i]
             alpha_prev_hat = self.alpha_hat[next_i] if next_i >= 0 else 1.0
-            steps = current_i - next_i
+            delta_steps = current_i - next_i
             # model predictions
             with torch.enable_grad():
                 x_t.requires_grad_()
                 e = self.predict_noise(x_t, current_i)
                 # computing x_{t-1}
-                x0_hat = np.sqrt(1 / max(alpha_hat, 0.001)) * x_t - np.sqrt(1 / max(alpha_hat, 0.001) - 1) * e
+                x0_hat = np.sqrt(1 / max(alpha_hat, 0.00001)) * x_t - np.sqrt(1 / max(alpha_hat, 0.00001) - 1) * e
                 # x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
                 x0_hat /= max(1.0, x0_hat.abs().max().item())
                 # x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
+                # x0_hat_detach = torch.clamp(x0_hat.detach(), -1.0, 1.0)
                 x0_hat_detach = x0_hat.detach()
+                if callback is not None:
+                    callback(current_i + 1, x0_hat_detach)
                 sigma = eta * np.sqrt((1 - alpha_hat/alpha_prev_hat) * (1 - alpha_prev_hat) / (1 - alpha_hat))
                 c = np.sqrt(1 - alpha_prev_hat - sigma ** 2)
                 z = torch.randn_like(x_t) if current_i > 0 else 0.0
                 x_next = np.sqrt(alpha_prev_hat) * x0_hat_detach + c * e.detach()
                 x_next += sigma * z
-                if current_i > 0 and criteria is not None:
+                if next_i >= 0 and criteria is not None:
                     loss = criteria(x0_hat[0])
-                    # loss.backward()
-                    # grad_xt = x_t.grad.clone()
+                    # loss += (x0_hat ** 2).sum() * 1e-9
+                    # grad_x0 = torch.autograd.grad(loss, x0_hat)[0]
                     grad_xt = torch.autograd.grad(loss, x_t)[0]
-                    grad_norm = max(.001, np.sqrt(loss.item()))
-                    if True:  #ema_grad_xt is None:
-                        ema_grad_xt = grad_xt
-                    else:
-                        a = 0.2 # (0.95 * (current_i / (self.timesteps - 1)) + 0.05)
-                        ema_grad_xt = ema_grad_xt * (1 - a) + grad_xt * a
-                    x_next -= weight * 0.5 * ema_grad_xt * steps / grad_norm
-                    # x_next -= weight * 0.5 * grad_xt * steps_rate / grad_norm
+                    grad_norm = max(.001, np.sqrt((grad_xt ** 2).sum().item()))
+                    # grad_norm = max(.00001, np.sqrt(loss.item())) #max(0.0001, torch.norm(grad_xt).item())# + .00001 # + np.sqrt(loss.item())
+                    x_next -= np.sqrt(1 - alpha_prev_hat) * 0.5 * delta_steps * weight * grad_xt / grad_norm
+                    # x_next -= (sigma) * weight * grad_xt * delta_steps / grad_norm
+                    # x_next -= np.sqrt(alpha_hat / alpha_prev_hat) * weight * 0.5 * grad_xt * delta_steps  # / grad_norm
                 x_t.detach_()
-            x_t = x_next
-            # x_t = torch.clamp(x_next, -1.0, 1.0)
+            x_t = x_next.detach()
         return x_t
 
     def parameterized_posterior_sampling_DPS(self,

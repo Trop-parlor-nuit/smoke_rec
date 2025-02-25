@@ -326,6 +326,9 @@ class Pipeline:
     def get_enhanced_latent(self, latent_id):
         return torch.load(self.workplace +f"/enhanced/latent_{latent_id}.pt", map_location=self.get_device())
 
+    def get_test_latent(self, latent_id):
+        return torch.load(self.workplace +f"/test/latent_{latent_id}.pt", map_location=self.get_device())
+
     def get_number_of_latents_for_decoder_training(self):
         return self.settings['decoder']['train_N']
 
@@ -722,7 +725,12 @@ class Pipeline:
         zip_path = self.workplace + "/pretrained.zip"
         # Download the ZIP file
         print(f"Downloading file from Google Drive: {url}")
-        gdown.download(id="1sc_UWXun6EuCTk5OUwkBzzUJf6_LVa6f", output=zip_path, quiet=False)
+        file_id="1gtdgT9R4ZpxxC-8Id77N5MSw0j7jops6"
+        gdown.download(
+            f"https://drive.google.com/uc?export=download&confirm=pbef&id={file_id}",
+            zip_path
+        )
+        #gdown.download(id="1gtdgT9R4ZpxxC-8Id77N5MSw0j7jops6", output=zip_path, quiet=False)
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(self.workplace)
         # Optionally, remove the ZIP file after extraction
@@ -1154,8 +1162,23 @@ class Pipeline:
             fit_box=(1.0, 0.5, 1.0)
         )
 
-    def from_rep_to_grid(self, rep, resolution: int):
-        return modeling.reconstruct_grid3d(rep, ymin=-0.5, ymax=0.5, step_size=2.0/(resolution-1), device=self.get_device())
+    def from_rep_to_grid(self, rep, resolution: int, *, noise: float = 0.0):
+        return modeling.reconstruct_grid3d(
+            rep,
+            ymin=-0.5, ymax=0.5,
+            step_size=2.0/(resolution-1),
+            noise=noise,
+            device=self.get_device())
+
+    def from_latent_to_grid(self, latent: torch.Tensor, *,
+                            resolution: int = 128,
+                            noise: float = 0.0
+                            ):
+        return self.from_rep_to_grid(
+            self.from_latent_to_rep(latent),
+            resolution=resolution,
+            noise=noise
+        )
 
     def normalize_latent(self, latent: torch.Tensor):
         stats = self.get_normalization_stats()
@@ -1195,11 +1218,31 @@ class Pipeline:
 
     def denoise(self,
                 noise: torch.Tensor,
-                t: int, *,
-                samples: int = 1000,
+                steps: typing.List[int], *,
                 eta: float = 1.0,
                 callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
                 ):
+        """
+        Denoises the initial noise (assumed at step steps[0]) transitioning from steps[i] to steps[i+1] using DDIM sampling method.
+
+        Returns
+        -------
+        torch.Tensor
+            The state after all steps.
+
+        Parameters
+        ----------
+        noise: torch.Tensor
+            The noise corresponding to the step index steps[0].
+        steps: typing.List[int]
+            The sequence of time steps will be transitioned. Steps must appear decreasingly, all in range [0..T]
+        eta: float
+            Hyper-parameter of the DDIM method. 0 determined solely from x_T, 1.0 equivalent to DDPM.
+        callback:
+            Function that will be called after each transition with the current step index and estimated
+        """
+        if len(steps) <= 1:  # nothing to do
+            return noise
         diffuser, _ = self.get_diffuser()
         with torch.no_grad():
             if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
@@ -1207,11 +1250,39 @@ class Pipeline:
                     # return diffuser.eval_generator(noise.unsqueeze(0), t)[0]
                     def wrap_callback(i, l):
                         callback(i, l[0])
-                    return diffuser.reverse_diffusion_DDIM(noise.unsqueeze(0), t, eta=eta, samples=samples, callback=wrap_callback if callback is not None else None)[0]
+                    return diffuser.reverse_diffusion_DDIM(
+                        noise.unsqueeze(0), steps=steps, eta=eta, callback=wrap_callback if callback is not None else None)[0]
                 if len(noise.shape) == 4:  # batch
                     # return diffuser.eval_generator(noise, t)
-                    return diffuser.reverse_diffusion_DDIM(noise, t, eta=eta, samples=samples, callback=callback)
+                    return diffuser.reverse_diffusion_DDIM(noise, steps=steps, eta=eta, callback=callback)
                 raise Exception()
+            else:
+                raise NotImplemented()
+
+    def posterior_sample(self,
+                         noise: torch.Tensor,
+                         steps: typing.List[int], *,
+                         eta: float = 1.0,
+                         criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                         criteria_scale: float = 1.0,
+                         callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                         ):
+        if len(steps) <= 1:  # nothing to do
+            return noise
+        assert len(noise.shape) == 3
+        diffuser, _ = self.get_diffuser()
+        diffuser.eval()
+        with torch.no_grad():
+            if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
+                def wrap_callback(i, l):
+                    callback(i, l[0])
+                return diffuser.posterior_sampling_DPS_DDIM(
+                    noise,
+                    steps,
+                    eta=eta,
+                    criteria=criteria,
+                    weight=criteria_scale,
+                    callback=wrap_callback if callback is not None else None)[0]
             else:
                 raise NotImplemented()
 
@@ -1228,38 +1299,152 @@ class Pipeline:
 
     def generate_normalized_latent(self,
                                    start_noise: typing.Optional[torch.Tensor] = None,
-                                   batch_size: typing.Optional[int] = None, *,
+                                   start_step: typing.Optional[int] = None, *,
                                    samples: int = 1000,
+                                   scheduler_gamma: float = 0.5,
                                    eta: float = 1.0,
+                                   criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                                   criteria_scale: float = 1.0,
                                    callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
                                    ):
-        assert start_noise is None or batch_size is None or start_noise.shape[0] == batch_size
+        """
+        Generates a normalized latent from the diffuser.
+        Parameters
+        ----------
+        start_noise: torch.Tensor | None
+            The initial noise. If None, a proper gaussian noise is used.
+            If the shape is BxFxRxR, the batch size B is used to generate a batch of latents instead of a single latent.
+        start_step: int | None
+            If start_noise is not None, this is the corresponding step index. If None, the step T (timesteps) is assumed.
+        samples: int
+            Number of step samples from start_step to 0, distributed with a power scheduler. T*((t/T) ** gamma)
+        scheduler_gamma: float
+            gamma value used for the scheduler of the steps.
+        eta: float
+            eta parameter for the DDIM sampling. eta = 0 is solely determined by x_T, eta=1 is equivalent to DDPM.
+        criteria: typing.Callable[[torch.Tensor], torch.Tensor] | None
+            If criteria is provided, the gradient is used to guide the posterior sampling towards an optimization goal.
+            The latent for the gradient computation is provided (denormalized).
+        callback:
+            If callback is provided, the estimated latent for each denoising step it is sent to the function with the step index.
+
+        Returns
+        -------
+        torch.Tensor
+            The generated latent or latents normalized. (FxRxR) or (BxFxRxR)
+
+        Examples
+        --------
+        >>> import cloudy
+        >>> pipeline = cloudy.create_pipeline('./test')
+        >>> pipeline.download_pretrained()
+        >>> # Unconditional sampling
+        >>> latent = pipeline.generate_normalized_latent(samples=50)
+        >>> # Conditional sampling (Inpainting)
+        >>> # load reference cloud
+        >>> mask = ...., reference_cloud = ...
+        >>> masked_reference = mask * reference_cloud
+        >>> latent = pipeline.generate_normalized_latent(samples=50, criteria=lambda l: (pipeline.from_latent_to_grid(pipeline.denormalize_latent(l)) * mask - masked_reference)**2)
+        """
+        assert criteria is not None or start_noise is None or len(start_noise) == 3, \
+            "Posterior sampling is not supported for batch generation. Generate a single latent at a time."
+        assert start_step is None or start_noise is not None, \
+            "start_step requires a existing noise state to be provided."
         if start_noise is None:
-            start_noise = self.random_gaussian_latent(batch_size=batch_size)
+            start_noise = self.random_gaussian_latent()
         diffuser, _ = self.get_diffuser()
         diffuser.eval()
-        return self.denoise(
-            start_noise,
-            diffuser.timesteps - 1,
-            samples=samples,
-            eta=eta,
-            callback=callback
-        )
+        if start_step is None:
+            start_step = diffuser.timesteps
+        x = np.arange(0.0, 1.00001, 1.0/samples)
+        x = x ** scheduler_gamma  # scheduler
+        x = (x * start_step).astype(np.int32)
+        steps = list(x)
+        steps.reverse()
+        if criteria is None:
+            return self.denoise(
+                start_noise,
+                steps=steps,
+                eta=eta,
+                callback=callback
+            )
+        else:
+            return self.posterior_sample(
+                start_noise,
+                steps=steps,
+                eta=eta,
+                criteria=criteria,
+                criteria_scale=criteria_scale,
+                callback=callback
+            )
 
     def generate_latent(self,
                         start_noise: typing.Optional[torch.Tensor] = None,
-                        batch_size: typing.Optional[int] = None, *,
+                        start_step: typing.Optional[int] = None,
+                        *,
                         samples: int = 1000,
+                        scheduler_gamma: float = 0.5,
                         eta: float = 1.0,
+                        criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                        criteria_scale: float = 1.0,
                         callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
         ):
+        """
+        Generates a latent from the diffuser.
+        Parameters
+        ----------
+        start_noise: torch.Tensor | None
+            The initial noise. If None, a proper gaussian noise is used.
+            If the shape is BxRxRxF, the batch size B is used to generate a batch of latents instead of a single latent.
+        start_step: int | None
+            If start_noise is not None, this is the corresponding step index. If None, the step T (timesteps) is assumed.
+        samples: int
+            Number of step samples from start_step to 0, distributed with a power scheduler. T*((t/T) ** gamma)
+        scheduler_gamma: float
+            gamma value used for the scheduler of the steps.
+        eta: float
+            eta parameter for the DDIM sampling. eta = 0 is solely determined by x_T, eta=1 is equivalent to DDPM.
+        criteria: typing.Callable[[torch.Tensor], torch.Tensor] | None
+            If criteria is provided, the gradient is used to guide the posterior sampling towards an optimization goal.
+            The latent for the gradient computation is provided (denormalized).
+        callback:
+            If callback is provided, the estimated latent for each denoising step it is sent to the function with the step index.
+
+        Returns
+        -------
+        torch.Tensor
+            The generated latent or latents denormalized. (RxRxF) or (BxRxRxF)
+
+        Examples
+        --------
+        >>> import cloudy
+        >>> pipeline = cloudy.create_pipeline('./test')
+        >>> pipeline.download_pretrained()
+        >>> # Unconditional sampling
+        >>> latent = pipeline.generate_latent(samples=50)
+        >>> # Conditional sampling (Inpainting)
+        >>> # load reference cloud
+        >>> mask = ...., reference_cloud = ...
+        >>> masked_reference = mask * reference_cloud
+        >>> latent = pipeline.generate_latent(samples=50, criteria=lambda l: (pipeline.from_latent_to_grid(l) * mask - masked_reference)**2)
+        """
+        assert criteria is not None or start_noise is None or len(start_noise) == 3, \
+            "Posterior sampling is not supported for batch generation. Generate a single latent at a time."
+
         def wrap_callback(i, l):
             callback(i, self.denormalize_latent(l))
+
+        def wrap_criteria(l):
+            return criteria(self.denormalize_latent(l))
+
         latent = self.generate_normalized_latent(
             start_noise=start_noise,
-            batch_size=batch_size,
+            start_step=start_step,
             samples=samples,
+            scheduler_gamma=scheduler_gamma,
             eta=eta,
+            criteria=wrap_criteria if criteria is not None else None,
+            criteria_scale=criteria_scale,
             callback=wrap_callback if callback is not None else None
         )
         return self.denormalize_latent(latent)

@@ -28,6 +28,14 @@ def camera_poses(
     return camera_poses
 
 
+def environment_objects(environment: torch.Tensor):
+    ds = rdv.DependencySet()
+    ds.add_parameters(environment_tensor = environment)
+    ds.requires(rdv.medium_environment)
+    ds.requires(rdv.medium_environment_sampler_quadtree)
+    return ds.environment, ds.environment_sampler
+
+
 def oct_camera_poses(N: int, *, seed: int = 15, distance: float = 2.0):
     return rdv.oct_camera_poses(N, seed=seed, radius=distance)
 
