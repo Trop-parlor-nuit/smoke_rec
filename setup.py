@@ -13,7 +13,8 @@ setup(
     package_dir={"": "src"},  # Map the root package directory to "src"
     # packages=find_packages(),             # Automatically find packages in your project
     install_requires=[
-        "rendervous @ git+https://github.com/rendervous/rendervous_project.git"
+        "rendervous @ git+https://github.com/rendervous/rendervous_project.git",
+        "denoising_diffusion_pytorch"
     ],
     include_package_data=True,
     extras_requires={
