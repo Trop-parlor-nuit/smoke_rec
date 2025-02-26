@@ -315,19 +315,19 @@ class Pipeline:
         if map_location is None:
             map_location = self.get_device()
         f = self.get_clouds_path() + f"/cloud_{cloud_id}.pt"
-        return torch.load(f, map_location=map_location)
+        return torch.load(f, map_location=map_location, weights_only=True)
 
     def get_volume(self, cloud_id):
         return self.from_grid_to_volume(self.get_cloud(cloud_id))
 
     def get_encoded_latent(self, cloud_id):
-        return torch.load(self.workplace +f"/encoded/latent_{cloud_id}.pt", map_location=self.get_device())
+        return torch.load(self.workplace +f"/encoded/latent_{cloud_id}.pt", map_location=self.get_device(), weights_only=True)
 
     def get_enhanced_latent(self, latent_id):
-        return torch.load(self.workplace +f"/enhanced/latent_{latent_id}.pt", map_location=self.get_device())
+        return torch.load(self.workplace +f"/enhanced/latent_{latent_id}.pt", map_location=self.get_device(), weights_only=True)
 
     def get_test_latent(self, latent_id):
-        return torch.load(self.workplace +f"/test/latent_{latent_id}.pt", map_location=self.get_device())
+        return torch.load(self.workplace +f"/test/latent_{latent_id}.pt", map_location=self.get_device(), weights_only=True)
 
     def get_number_of_latents_for_decoder_training(self):
         return self.settings['decoder']['train_N']
@@ -347,15 +347,15 @@ class Pipeline:
             cp = last_file_id(self.workplace + "/decoder", "latents_", ".pt")
         if cp == 0:  # No cp
             raise Exception("No latents saved yet.")
-        return torch.load(self.workplace+f"/decoder/latents_{cp}.pt", map_location=self.get_device())
+        return torch.load(self.workplace+f"/decoder/latents_{cp}.pt", map_location=self.get_device(), weights_only=True)
 
     def get_volume_for_decoder_training(self, id: int):
         try:
-            ids = torch.load(self.workplace + "/decoder/batch_used.pt")
+            ids = torch.load(self.workplace + "/decoder/batch_used.pt", weights_only=True)
         except:
             raise Exception("No trained decoder yet.")
         return self.from_grid_to_volume(torch.load(
-                self.get_clouds_path() + f"/cloud_{ids[id]}.pt", map_location=self.get_device()
+                self.get_clouds_path() + f"/cloud_{ids[id]}.pt", map_location=self.get_device(), weights_only=True
             ))
 
     def get_decoder(self, cp: typing.Optional[int] = None):
@@ -371,8 +371,8 @@ class Pipeline:
             if cp is None:
                 cp = last_file_id(self.workplace + "/decoder", "decoder_",".pt")
             if cp > 0:  # some checkpoint found
-                decoder.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_{cp}.pt"))
-                upsampler.load_state_dict(torch.load(self.workplace + f"/decoder/upsampler_{cp}.pt"))
+                decoder.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_{cp}.pt", weights_only=True))
+                upsampler.load_state_dict(torch.load(self.workplace + f"/decoder/upsampler_{cp}.pt", weights_only=True))
             self.decoding = decoder, upsampler, cp
         assert cp is None or self.decoding[2] == cp
         self.decoding[0].eval()
@@ -392,20 +392,20 @@ class Pipeline:
                 cp = last_file_id(self.workplace + "/diffuser", "denoiser_", ".pt")
             if cp > 0:  # some checkpoint found
                 if use_ema:
-                    diffuser.denoiser.load_state_dict(torch.load(self.workplace + f"/diffuser/denoiser_{cp}.pt"))
+                    diffuser.denoiser.load_state_dict(torch.load(self.workplace + f"/diffuser/denoiser_{cp}.pt", weights_only=True))
                 else:
-                    diffuser.load_state_dict(torch.load(self.workplace + f"/diffuser/optimizing_{cp}.pt")['model'])
+                    diffuser.load_state_dict(torch.load(self.workplace + f"/diffuser/optimizing_{cp}.pt", weights_only=True)['model'])
             self.diffuser = diffuser, cp
         self.diffuser[0].eval()
         return self.diffuser
 
     def get_normalization_stats(self):
         if not hasattr(self, 'norm_stats'):
-            self.norm_stats = torch.load(self.workplace + "/enhanced/stats.pt", map_location=self.get_device())
+            self.norm_stats = torch.load(self.workplace + "/enhanced/stats.pt", map_location=self.get_device(), weights_only=True)
         return self.norm_stats
 
     def load_cloud_grid(self, cloud_id):
-        return torch.load(self.get_clouds_path() + f"/cloud_{cloud_id}.pt", map_location=preferred_device())
+        return torch.load(self.get_clouds_path() + f"/cloud_{cloud_id}.pt", map_location=preferred_device(), weights_only=True)
 
     def run_train_decoder_batched(self):
         settings = self.settings['decoder']
@@ -418,7 +418,7 @@ class Pipeline:
         K = settings['train_K']
         if not os.path.exists(output_path + "/batch_used.pt"):
             torch.save(random_subset(self.get_number_of_clouds(), N), output_path + "/batch_used.pt")
-        ids = torch.load(output_path + "/batch_used.pt")
+        ids = torch.load(output_path + "/batch_used.pt", weights_only=True)
         # get decoder
         decoder, upsampler, cp = self.get_decoder()
         cp_every = settings['cp_every']
@@ -430,7 +430,7 @@ class Pipeline:
         # load latent current state
         if cp > 0:
             with torch.no_grad():
-                latents.copy_(torch.load(self.workplace + f"/decoder/latents_{cp}.pt"))
+                latents.copy_(torch.load(self.workplace + f"/decoder/latents_{cp}.pt", weights_only=True))
         # get optimizer objects
         decoder_opt, decoder_sch = create_optimization_objects(
             list(decoder.parameters())+list(upsampler.parameters()),
@@ -439,8 +439,8 @@ class Pipeline:
         latents_opt, latents_sch = create_optimization_objects([latents], **settings)
 
         if cp > 0:  # load optimizer states if checkpoint exists
-            decoder_opt.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_opt_{cp}.pt"))
-            latents_opt.load_state_dict(torch.load(self.workplace+f"/decoder/latents_opt_{cp}.pt"))
+            decoder_opt.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_opt_{cp}.pt", weights_only=True))
+            latents_opt.load_state_dict(torch.load(self.workplace+f"/decoder/latents_opt_{cp}.pt", weights_only=True))
 
         # Set enhancing transforms
         if rep_mode == RepresentationModes.monoplanar_128_32:
@@ -573,7 +573,7 @@ class Pipeline:
         N = settings['train_N']
         if not os.path.exists(output_path + "/batch_used.pt"):
             torch.save(random_subset(self.get_number_of_clouds(), N), output_path + "/batch_used.pt")
-        ids = torch.load(output_path + "/batch_used.pt")
+        ids = torch.load(output_path + "/batch_used.pt", weights_only=True)
         # get decoder
         decoder, upsampler, cp = self.get_decoder()
         cp_every = settings['cp_every']
@@ -585,7 +585,7 @@ class Pipeline:
         # load latent current state
         if cp > 0:
             with torch.no_grad():
-                latents.copy_(torch.load(self.workplace + f"/decoder/latents_{cp}.pt"))
+                latents.copy_(torch.load(self.workplace + f"/decoder/latents_{cp}.pt", weights_only=True))
         # get optimizer objects
         decoder_opt, decoder_sch = create_optimization_objects(
             list(decoder.parameters())+list(upsampler.parameters()),
@@ -594,8 +594,8 @@ class Pipeline:
         latents_opt, latents_sch = create_optimization_objects([latents], **settings)
 
         if cp > 0:  # load optimizer states if checkpoint exists
-            decoder_opt.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_opt_{cp}.pt"))
-            latents_opt.load_state_dict(torch.load(self.workplace+f"/decoder/latents_opt_{cp}.pt"))
+            decoder_opt.load_state_dict(torch.load(self.workplace+f"/decoder/decoder_opt_{cp}.pt", weights_only=True))
+            latents_opt.load_state_dict(torch.load(self.workplace+f"/decoder/latents_opt_{cp}.pt", weights_only=True))
 
         # Set enhancing transforms
         if rep_mode == RepresentationModes.monoplanar_128_32:
@@ -893,7 +893,7 @@ class Pipeline:
             cloud_id = 0
             while os.path.exists(
                     augmented_dataset_path + f"/latent_{cloud_id}.pt"):
-                l = torch.load(augmented_dataset_path + f"/latent_{cloud_id}.pt", map_location=self.get_device())
+                l = torch.load(augmented_dataset_path + f"/latent_{cloud_id}.pt", map_location=self.get_device(), weights_only=True)
                 latent_mean += (l[0, 0] + l[0, 127] + l[127, 0] + l[127, 127]) / 4
                 latent_max = torch.maximum(latent_max, l.max(dim=0)[0].max(dim=0)[0])
                 latent_min = torch.minimum(latent_min, l.min(dim=0)[0].min(dim=0)[0])
@@ -943,7 +943,7 @@ class Pipeline:
             with torch.no_grad():
                 for i, id in enumerate(ids):
                     images[i].copy_(torch.load(augmented_dataset_path + f"/latent_{id}.pt",
-                                               map_location=self.get_device()).permute(2, 0, 1))  # channels first
+                                               map_location=self.get_device(), weights_only=True).permute(2, 0, 1))  # channels first
                 images.add_(other=mean, alpha=-1.0)
                 images.mul_(1.0 / scale)
 
@@ -954,7 +954,7 @@ class Pipeline:
         optimizer, scheduler = create_optimization_objects(diffuser.diffusion.parameters(), **settings)
         if cp > 0:
             if os.path.exists(f"{result_path}/optimizer_{cp}.pt"):
-                optimizer.load_state_dict(torch.load(f"{result_path}/optimizer_{cp}.pt"))
+                optimizer.load_state_dict(torch.load(f"{result_path}/optimizer_{cp}.pt", weights_only=True))
                 print(f"[INFO] Starting from lr: {optimizer.param_groups[0]['lr']}")
         batch_size = settings['train_B']
         z_0 = torch.randn(1, diffuser.channels, diffuser.resolution, diffuser.resolution, device=device)
@@ -1051,7 +1051,7 @@ class Pipeline:
             with torch.no_grad():
                 for i, id in enumerate(ids):
                     images[i].copy_(torch.load(augmented_dataset_path + f"/latent_{id}.pt",
-                                               map_location=self.get_device()).permute(2, 0, 1))  # channels first
+                                               map_location=self.get_device(), weights_only=True).permute(2, 0, 1))  # channels first
                 images.add_(other=mean, alpha=-1.0)
                 images.mul_(1.0 / scale)
 
@@ -1062,7 +1062,7 @@ class Pipeline:
         optimizer, scheduler = create_optimization_objects(parallel_diffuser.parameters(), **settings)
         if cp > 0:
             if os.path.exists(f"{result_path}/optimizing_{cp}.pt"):
-                opt_data = torch.load(f"{result_path}/optimizing_{cp}.pt")
+                opt_data = torch.load(f"{result_path}/optimizing_{cp}.pt", weights_only=True)
                 parallel_diffuser.module.load_state_dict(opt_data['model'])
                 optimizer.load_state_dict(opt_data['opt'])
                 # only to fix the restart lr problem

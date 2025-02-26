@@ -32,6 +32,7 @@ Setting up the pipeline, generating a cloud and rendering.
 </td>
 <td>
 Cloud super resolution.
+<a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e02_cloud_super_resolution.ipynb">open in colab</a>
 </td>
 </tr>
 <tr>
@@ -40,6 +41,7 @@ Cloud super resolution.
 </td>
 <td>
 Cloud inpainting.
+<a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e03_cloud_inpainting.ipynb">open in colab</a>
 </td>
 </tr>
 <tr>
