@@ -34,6 +34,14 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </td>
 </tr>
 
+<tr>
+<td><img width="512pt" src="./images/tutorial_03_inpainting.webp"/></td>
+<td>
+<b>Cloud Inpainting:</b> In this example, a diffusion posterior sampling technique is used to match a masked volume with a cloud completion.
+<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
+</td>
+</tr>
+
 </table>
 
 |                                                                                                                                                                                                                                               |                                                                                                                                                                                                                                                      |
