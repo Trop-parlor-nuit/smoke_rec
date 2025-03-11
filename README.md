@@ -1,10 +1,10 @@
 
 <!--![](./images/generated_example_2.webp)-->
 
-<table>
+<table >
 <tr>
-<td style="width: 512px" >
-<img style="width: 512px;" src="./images/generated_example_2.webp"/>
+<td>
+<img width="1024pt" src="./images/generated_example_2.webp"/>
 </td>
 <td>
 <h1> Cloudy </h1>
