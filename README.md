@@ -27,7 +27,7 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 
 
 <tr>
-<td><img width="512pt" src="./images/generated_cloud_super_resolution.webp"/></td>
+<td><img width="512pt" src="./images/tutorial_02_super_resolution.webp"/></td>
 <td>
 <b>Cloud Super-resolution:</b> In this example, a diffusion posterior sampling technique is used to match a coarse representation with fine details.
 <br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
