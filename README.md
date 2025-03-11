@@ -42,6 +42,14 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </td>
 </tr>
 
+<tr>
+<td><img width="512pt" src="./images/tutorial_04_single_view_reconstruction.webp"/></td>
+<td>
+<b>Single View Reconstruction:</b> In this example, a diffusion posterior sampling technique is used to match a single view.
+<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
+</td>
+</tr>
+
 </table>
 
 |                                                                                                                                                                                                                                               |                                                                                                                                                                                                                                                      |
