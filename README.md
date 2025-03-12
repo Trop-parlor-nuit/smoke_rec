@@ -50,20 +50,11 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </td>
 </tr>
 
+<tr>
+<td><img width="512pt" src="./images/tutorial_04_single_view_reconstruction.webp"/></td>
+<td>
+<b>Parameterized Reconstruction:</b> In this example, a parametric diffusion posterior sampling technique is used to match a single view and reconstruct environment and volume.
+<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
+</td>
+</tr>
 </table>
-
-|                                                                                                                                                                                                                                               |                                                                                                                                                                                                                                                      |
-|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| <img width="256pt" src="./images/tutorial_01_generating_clouds.webp"/></br>Cloud generation<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a> | <img width="256pt" src="./images/generated_cloud_super_resolution.webp"/><br/>Cloud super resolution<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e02_cloud_super_resolution.ipynb">open in colab</a>       |
-| <img width="256pt" src="./images/generated_cloud_inpainting.webp"/></br>Cloud inpainting<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e03_cloud_inpainting.ipynb">open in colab</a>                  | <img width="256pt" src="./images/generated_cloud_single_view.webp"/><br/>Single-view Reconstruction<br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e03_cloud_inpainting.ipynb">open in colab</a> |
- 
- 
-
-
-
-
-
-
-
-
-
