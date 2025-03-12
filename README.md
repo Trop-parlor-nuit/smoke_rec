@@ -51,7 +51,7 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </tr>
 
 <tr>
-<td><img width="512pt" src="./images/tutorial_04_single_view_reconstruction.webp"/></td>
+<td><img width="512pt" src="./images/tutorial_06_parametric_sampling_environment.webp"/></td>
 <td>
 <b>Parameterized Reconstruction:</b> In this example, a parametric diffusion posterior sampling technique is used to match a single view and reconstruct environment and volume.
 <br/><a href="https://colab.research.google.com/github/rendervous/cloudy_project/blob/main/examples/e01_generating_clouds.ipynb">open in colab</a>
