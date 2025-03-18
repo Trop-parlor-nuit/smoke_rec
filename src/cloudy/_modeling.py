@@ -292,7 +292,9 @@ def reconstruct_grid3d(
         xmin: float = -1.0, xmax: float = 1.0,
         ymin: float = -1.0, ymax: float = 1.0,
         zmin: float = -1.0, zmax: float = 1.0,
-        step_size: float = 0.004,
+        resx : int = 256,
+        resy : int = 128,
+        resz : int = 256,
         batch_if_greater : int = 129*65*129,
         noise: float = 0.0,
         device: typing.Optional[torch.device] = None
@@ -300,16 +302,22 @@ def reconstruct_grid3d(
     if device is None:
         assert isinstance(rep_function, torch.nn.Module), "Can only infer device if rep_function is a torch.nn.Module object"
         device = next(iter(rep_function.parameters())).device
-    x = torch.arange(xmin, xmax + 0.0000001, step_size, device=device)
-    y = torch.arange(ymin, ymax + 0.0000001, step_size, device=device)
-    z = torch.arange(zmin, zmax + 0.0000001, step_size, device=device)
+    stepx = (xmax - xmin)/(resx - 1)
+    stepy = (ymax - ymin)/(resy - 1)
+    stepz = (zmax - zmin)/(resz - 1)
+    x = torch.arange(xmin, xmax + 0.0000001, stepx, device=device)
+    y = torch.arange(ymin, ymax + 0.0000001, stepy, device=device)
+    z = torch.arange(zmin, zmax + 0.0000001, stepz, device=device)
     count_values = len(x) * len(y) * len(z)
     if count_values <= batch_if_greater:  # no batched solution
         p = torch.cartesian_prod(z, y, x)[:, [2, 1, 0]]
         if noise > 0:
-            # p += (torch.rand_like(p)-.5) * step_size * noise
-            p += torch.randn_like(p) * step_size * noise
-        return rep_function(p).view(len(z), len(y), len(x), -1)
+            cell_size = torch.tensor([stepx, stepy, stepz], device=p.device)
+            p += (torch.rand_like(p)-.5) * cell_size.view(1, 3) * noise
+            # p += torch.randn_like(p) * cell_size.view(1, 3) * noise
+        g = rep_function(p).view(len(z), len(y), len(x), -1)
+        torch.cuda.empty_cache()
+        return g
     else:
         x_count = len(x)
         y_count = len(y)
@@ -1548,7 +1556,7 @@ class GaussianDiffuser2D(torch.nn.Module):
                                x_t: torch.Tensor,
                                steps: typing.Optional[typing.List[int]] = None,
                                eta: float = 1.0,
-                               callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                               callback: typing.Optional[typing.Callable[[int, int, int, torch.Tensor], None]] = None
                                ):
         if steps is None:
             steps = list(range(0, self.timesteps+1))
@@ -1559,28 +1567,32 @@ class GaussianDiffuser2D(torch.nn.Module):
         steps.sort()
         steps.reverse()
         iterations = tqdm(range(len(steps)-1), 'Unconditional sampling DDIM')
+        x0_ema = None
         for i in iterations:
             current_i = steps[i] - 1
             next_i = steps[i + 1] - 1
-            alpha_hat = max(0.0, self.alpha_hat[current_i])
-            alpha_prev_hat = max(0.0, self.alpha_hat[next_i]) if next_i >= 0 else 1.0
+            alpha_hat = max(0.0001, self.alpha_hat[current_i])
+            alpha_prev_hat = max(0.0001, self.alpha_hat[next_i]) if next_i >= 0 else 1.0
             ## Computing x_{t-1} ##
             e = self.predict_noise(x_t, current_i)
             x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
-            # x0_hat = np.sqrt(1 / max(alpha_hat, 0.001)) * x_t - np.sqrt(max(0.0, 1 / alpha_hat - 1)) * e
+            # x0_hat = np.sqrt(1 / max(alpha_hat, 0.001)) * x_t - np.sqrt(max(0.001, 1 / alpha_hat - 1)) * e
             x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
+            if x0_ema is None: # or current_i > 200:
+                x0_ema = x0_hat
+            else:
+                alpha = 0.8 * ((self.timesteps - current_i)/self.timesteps) ** 2 #  * (((current_i + 1)/self.timesteps)**2)
+                torch.add(x0_ema * alpha, other=x0_hat, alpha=1 - alpha, out=x0_ema)
+            # x0_hat *= 1.0 / max(1.0, x0_hat.abs().max().item())
             if callback is not None:
-                callback(current_i + 1, x0_hat)
-            # x0_hat *= 1.0 / max(1.0, x0_hat.abs().max().item() * 0.4)
-            sigma = eta *  np.sqrt ((1 - alpha_hat/alpha_prev_hat) * (1 - alpha_prev_hat) / (1 - alpha_hat))
+                callback(i, len(steps) - 1, current_i + 1, x0_ema)
+            sigma = eta * np.sqrt ((1 - alpha_hat/alpha_prev_hat) * (1 - alpha_prev_hat) / (1 - alpha_hat))
             c = np.sqrt(1 - alpha_prev_hat - sigma ** 2)
-            z = torch.randn_like(x_t) if current_i > 0 else 0.0
-            x_t = np.sqrt(alpha_prev_hat) * x0_hat + c * e
+            z = torch.randn_like(x_t) if next_i >= 0 else 0.0
+            x_t = np.sqrt(alpha_prev_hat) * x0_ema + c * e
             x_t = x_t + sigma * z
         # x_t = torch.clamp(x_t, -1.0, 1.0)
-        if callback is not None:
-            callback(0, x_t)
-        return x_t
+        return x0_ema
 
     def forward_diffusion(self, x_k: torch.Tensor, k: typing.Optional[int] = None, steps: typing.Optional[int] = None, noise: torch.Tensor = None):
         if k is None:
@@ -1609,10 +1621,12 @@ class GaussianDiffuser2D(torch.nn.Module):
     def posterior_sampling_DPS_DDIM(self,
                                 x_t: torch.Tensor,
                                 steps: typing.List[int],
+                                y: torch.Tensor,
+                                A: typing.Callable[[torch.Tensor], torch.Tensor],
                                 eta: float = 1.0,
                                 weight: float = 1.0,
-                                criteria: typing.Optional[typing.Callable[[torch.Tensor], torch.Tensor]] = None,
-                                callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None):
+                                ema_factor: float = 1.0,
+                                callback: typing.Optional[typing.Callable[[int, int, int, torch.Tensor], None]] = None):
         if steps is None:
             steps = list(range(0, self.timesteps+1))
             steps.reverse()
@@ -1623,6 +1637,23 @@ class GaussianDiffuser2D(torch.nn.Module):
         steps.sort()
         steps.reverse()
         iterations = tqdm(range(len(steps)-1), 'Posterior sampling DPS_DDIM')
+        def step_size_scheduler_cosine(i):
+            alpha = i/self.timesteps
+            return (1 - np.cos(alpha ** 2 * 3.141593 * 2))*0.5
+        def step_size_scheduler_exp(i):
+            alpha = i/self.timesteps
+            return 0.995 ** (800*(1 - alpha))
+        steps_size_scheduler = step_size_scheduler_cosine
+
+        values = []
+        losses = []
+
+        # rescale max gradient norm to account for reduced samples
+        max_norm_scaler = self.timesteps / (len(steps) - 1)
+
+        x0_ema = None
+        y_ema = None
+
         for i in iterations:
             current_i = steps[i] - 1
             next_i = steps[i+1] - 1
@@ -1630,36 +1661,79 @@ class GaussianDiffuser2D(torch.nn.Module):
             alpha_prev_hat = self.alpha_hat[next_i] if next_i >= 0 else 1.0
             delta_steps = current_i - next_i
             # model predictions
-            with torch.enable_grad():
+            with (torch.enable_grad()):
                 x_t.requires_grad_()
                 e = self.predict_noise(x_t, current_i)
                 # computing x_{t-1}
-                x0_hat = np.sqrt(1 / max(alpha_hat, 0.00001)) * x_t - np.sqrt(1 / max(alpha_hat, 0.00001) - 1) * e
-                # x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
-                x0_hat /= max(1.0, x0_hat.abs().max().item())
-                # x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
+                # x0_hat = np.sqrt(1 / max(alpha_hat, 0.00001)) * x_t - np.sqrt(1 / max(alpha_hat, 0.00001) - 1) * e
+                x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
+                # x0_hat /= max(1.0, x0_hat.abs().max().item())
+                x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
                 # x0_hat_detach = torch.clamp(x0_hat.detach(), -1.0, 1.0)
                 x0_hat_detach = x0_hat.detach()
+                if x0_ema is None:
+                    x0_ema = x0_hat_detach
+                else:
+                    alpha = (0.8 ** (delta_steps*0.25)) * (((self.timesteps - current_i) / self.timesteps) ** 2)
+                    torch.add(x0_ema * alpha, other=x0_hat_detach, alpha=1 - alpha, out=x0_ema)
                 if callback is not None:
-                    callback(current_i + 1, x0_hat_detach)
+                    callback(i, len(steps) - 1, current_i + 1, x0_ema)
                 sigma = eta * np.sqrt((1 - alpha_hat/alpha_prev_hat) * (1 - alpha_prev_hat) / (1 - alpha_hat))
                 c = np.sqrt(1 - alpha_prev_hat - sigma ** 2)
-                z = torch.randn_like(x_t) if current_i > 0 else 0.0
-                x_next = np.sqrt(alpha_prev_hat) * x0_hat_detach + c * e.detach()
+                z = torch.randn_like(x_t) if next_i >= 0 else 0.0
+                x_next = np.sqrt(alpha_prev_hat) * x0_ema + c * e.detach()
                 x_next += sigma * z
-                if next_i >= 0 and criteria is not None:
-                    loss = criteria(x0_hat[0])
+                if current_i < self.timesteps * 0.95:
+                    yhat = A(x0_hat[0])
+                    if y_ema is None or ema_factor == 1.0:
+                        y_ema = yhat
+                    else:
+                        y_ema = ema_diff(yhat, y_ema, ema_factor)
+                    loss = ((y - y_ema)**2).sum()
                     # loss += (x0_hat ** 2).sum() * 1e-9
                     # grad_x0 = torch.autograd.grad(loss, x0_hat)[0]
                     grad_xt = torch.autograd.grad(loss, x_t)[0]
-                    grad_norm = max(.001, np.sqrt((grad_xt ** 2).sum().item()))
-                    # grad_norm = max(.00001, np.sqrt(loss.item())) #max(0.0001, torch.norm(grad_xt).item())# + .00001 # + np.sqrt(loss.item())
-                    x_next -= np.sqrt(1 - alpha_prev_hat) * 0.5 * delta_steps * weight * grad_xt / grad_norm
+                    y_ema = y_ema.detach()
+                    # loss_norm = max(0.1, np.sqrt(loss.item())) #max(0.0001, torch.norm(grad_xt).item())# + .00001 # + np.sqrt(loss.item())
+
+                    # sqr L2 norm of grad_xt
+                    grad_norm_sqr = (grad_xt ** 2).sum().item()
+                    grad_norm = np.sqrt(grad_norm_sqr) + 0.0001
+                    # compute one-step size
+                    # grad_xt *= (loss.item() / (grad_norm_sqr + 0.0001)) / grad_norm
+                    # clamp to a max norm
+                    # max_norm = steps_size_scheduler(current_i) * 20.0 * max_norm_scaler
+                    # grad_xt /= max(1, np.sqrt((grad_xt ** 2).sum().item())/(max_norm+0.0001))
+
+                    # grad_step = delta_steps * steps_size_scheduler(current_i) * weight * grad_xt / grad_norm
+                    # grad_step = steps_size_scheduler(current_i) * grad_xt / grad_norm
+                    # grad_step = weight * steps_size_scheduler(current_i) * grad_xt
+                    grad_step = alpha_hat * max_norm_scaler * weight * 8 * (step_size_scheduler_cosine(next_i+1)**0.5) * grad_xt / grad_norm
+                    # grad_step_norm = np.sqrt((grad_step ** 2).sum().item())
+                    # max_norm = 5.0 * max_norm_scaler
+                    # grad_step /= max(1, grad_step_norm/(max_norm+0.0001))
+
+                    x_next -= grad_step # / loss_norm # / loss_norm#  * loss_norm / grad_norm
+                    values.append(np.sqrt((grad_step**2).sum().item()))
+                    losses.append(loss.item())
+                    # x_next -= alpha_hat * np.sqrt(1 - alpha_prev_hat) * 0.5 * delta_steps * weight * grad_xt # / loss_norm#  * loss_norm / grad_norm
+                    # x_next -= np.sqrt(1 - alpha_hat) * delta_steps * weight * grad_xt / grad_norm
                     # x_next -= (sigma) * weight * grad_xt * delta_steps / grad_norm
                     # x_next -= np.sqrt(alpha_hat / alpha_prev_hat) * weight * 0.5 * grad_xt * delta_steps  # / grad_norm
                 x_t.detach_()
             x_t = x_next.detach()
-        return x_t
+
+        # mean_losses = sum(losses[len(losses)//2:]) * 2 / len(losses)
+        # p = 10 ** (int(np.log10(mean_losses))+1)
+        #
+        # import matplotlib.pyplot as plt
+        # plt.plot(values)
+        # plt.show()
+        # plt.plot(losses)
+        # plt.gca().set_ylim(0, p)
+        # plt.show()
+
+        return x0_ema
 
     def parameterized_posterior_sampling_DPS(self,
                                 x_t: torch.Tensor,

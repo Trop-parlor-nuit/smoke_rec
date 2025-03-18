@@ -1,16 +1,17 @@
+import copy
 import os
 import time
 from datetime import timedelta
+from typing import Any
 
 import torch.cuda
 import typing
 from . import _modeling as modeling
+from . import _rendering as rendering
 import numpy as np
 from tqdm import tqdm
 import rendervous as rdv
 import matplotlib.pyplot as plt
-
-from ._modeling import EMA
 
 if torch.cuda.is_available():
     __PREFERRED_DEVICE__ = torch.device('cuda')
@@ -56,7 +57,7 @@ def sample_slice (vol, step_size: float, umin=-1.0, umax=1.0, vmin=-1.0, vmax=1.
     return values.view(len(v), len(u), -1)
 
 
-def eval_monoplanar_representation(x: torch.Tensor, latent: torch.Tensor, upsampler: torch.nn.Module, decoder: torch.nn.Module,
+def eval_monoplanar_representation(x: torch.Tensor, latent: torch.Tensor, decoder: torch.nn.Module,
                     *,
                     features: typing.Optional[typing.Union[int, typing.List[int]]] = None,
                     samples: typing.Optional[typing.Union[int, typing.List[int]]] = None,
@@ -65,7 +66,6 @@ def eval_monoplanar_representation(x: torch.Tensor, latent: torch.Tensor, upsamp
                     ):
     xz = x[:, [0, 2]]
     y = x[:, [1]]
-    latent = upsampler(latent.unsqueeze(0))[0]
     g = modeling.sample_grid2d(latent, xz, mode='bicubic')
     f = modeling.sample_monoplanar(
         g,
@@ -79,9 +79,11 @@ def eval_monoplanar_representation(x: torch.Tensor, latent: torch.Tensor, upsamp
     return decoder(torch.cat([f, modeling.fourier_encode(y, fourier_levels)], dim=-1))
 
 
-def eval_monoplanar_128x32_X(x: torch.Tensor, latent: torch.Tensor, upsampler: torch.nn.Module, decoder: torch.nn.Module):
+def eval_monoplanar_128x32_X(x: torch.Tensor, latent: torch.Tensor, decoder: torch.nn.Module):
     return eval_monoplanar_representation(
-        x, latent, upsampler, decoder,
+        x,
+        latent,
+        decoder,
         features=[16, 48],
         samples=[16, 48],
         window_sizes=[1.0, .5],
@@ -89,9 +91,11 @@ def eval_monoplanar_128x32_X(x: torch.Tensor, latent: torch.Tensor, upsampler: t
     )
 
 
-def eval_monoplanar_128x32(x: torch.Tensor, latent: torch.Tensor, upsampler: torch.nn.Module, decoder: torch.nn.Module):
+def eval_monoplanar_128x32(x: torch.Tensor, latent: torch.Tensor, decoder: torch.nn.Module):
     return eval_monoplanar_representation(
-        x, latent, upsampler, decoder,
+        x,
+        latent,
+        decoder,
         features=[64],
         samples=[64],
         window_sizes=[1.0],
@@ -200,6 +204,530 @@ def create_optimization_objects(parameters, **settings):
     return optimizer, scheduler
 
 
+class Grid3DDecode(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx: Any, *args: Any, **kwargs: Any) -> Any:
+        latent, decoder, resx, resy, resz, noise, fw_batch_size, bw_batch_size = args
+        device = latent.device
+        ctx.decoder = decoder
+        ctx.bw_batch_size = bw_batch_size
+        stepx = 2.0 / (resx - 1)
+        stepy = 2.0 / (resy - 1)
+        stepz = 2.0 / (resz - 1)
+        cell_size = torch.tensor([stepx, stepy, stepz], device=device, dtype=torch.float32)
+        x = torch.arange(-1.0, 1.0000001, stepx, device=device)
+        y = torch.arange(-1.0, 1.0000001, stepy, device=device)
+        z = torch.arange(-1.0, 1.0000001, stepz, device=device)
+        p = torch.cartesian_prod(z, y, x)[:, [2, 1, 0]]
+        if noise > 0.0:
+            p += (torch.rand_like(p) - .5) * cell_size.view(-1,3) * noise
+        ctx.save_for_backward(latent, p)
+        number_of_samples = p.shape[0]
+        with torch.no_grad(): # just in case...
+            if fw_batch_size >= number_of_samples:
+                o = decoder(latent, p)
+            else:
+                o = None
+                offset = 0
+                import math
+                number_of_batches = int(math.ceil(number_of_samples / fw_batch_size))
+                for bp in torch.chunk(p, number_of_batches):
+                    bo = decoder(latent, bp)
+                    if o is None:
+                        o = torch.zeros(number_of_samples, bo.shape[-1], device=device)
+                    o[offset:offset + bo.shape[0],:].copy_(bo)
+                    offset += bo.shape[0]
+        return o.view(resz, resy, resx, o.shape[-1])
+
+    @staticmethod
+    def backward(ctx: Any, *grad_outputs: Any) -> Any:
+        grads, = grad_outputs
+        latent, p = ctx.saved_tensors
+        num_samples = p.shape[0]
+        grads = grads.view(num_samples, -1)
+        decoder = ctx.decoder
+        batch_size = ctx.bw_batch_size
+        import math
+        number_of_chunks = int(math.ceil(num_samples / batch_size))
+        batched_p = torch.chunk(p, number_of_chunks)
+        batched_grads = torch.chunk(grads, number_of_chunks)
+        latent_grad = torch.zeros_like(latent)
+        for bp, bg in zip(batched_p, batched_grads):
+            with torch.enable_grad():
+                bo = decoder(latent, bp)
+                bl_grad = torch.autograd.grad([bo], [latent], [bg])[0]
+            latent_grad.add_(bl_grad)
+        return latent_grad, None, None, None, None, None, None, None
+
+
+class LatentDecoder(torch.nn.Module):
+    def __init__(self, upsampler, decoder):
+        super().__init__()
+        upsampler = copy.deepcopy(upsampler)
+        decoder = copy.deepcopy(decoder)
+        for p in list(upsampler.parameters()) + list(decoder.parameters()):
+            p.requires_grad_(False)
+        self.upsampler = upsampler
+        self.decoder = decoder
+
+    def forward(self, *args, **kwargs):
+        latent, = args
+        resx = kwargs.get('resx')
+        resy = kwargs.get('resy')
+        resz = kwargs.get('resz')
+        noise = kwargs.get('noise', 0.0)
+        batch_size = kwargs.get('batch_size', None)
+        if batch_size is None:
+            batch_size = resx * resy * resz
+        bw_batch_size = max(1, batch_size // 8)
+
+        up_latent = self.upsampler(latent.unsqueeze(0))[0]
+
+        return Grid3DDecode.apply(
+            up_latent,
+            lambda ltn, x: eval_monoplanar_128x32(x, ltn, self.decoder),
+            resx, resy, resz,
+            noise,
+            batch_size,
+            bw_batch_size)
+
+
+class CallbackInfo:
+
+    def __init__(self,
+                 pipeline: 'Pipeline',
+                 step: int,
+                 total_steps: int,
+                 timestep: int,
+                 latent: torch.Tensor,
+                 normalized: bool,
+                 pass_index: int = 0,
+                 subpass: str = 'dps'
+                 ):
+        self._pipeline = pipeline
+        self._step = step
+        self._total_steps = total_steps
+        self._sampled_timestep = timestep
+        self._latent = pipeline.denormalize_latent(latent) if normalized else latent
+        self._normalized_latent = latent if normalized else pipeline.normalize_latent(latent)
+        self._pass_index = pass_index
+        self._subpass = subpass
+
+    @property
+    def sampled_timestep(self):
+        """
+        The timestep index within the whole timesteps (T...0).
+        """
+        return self._sampled_timestep
+
+    @property
+    def step(self):
+        """
+        The index of the current sample in the DDIM subsampling scheme [0...samples),
+        or step within an optimization process.
+        """
+        return self._step
+
+    @property
+    def total_steps(self):
+        """
+        The final total steps of the DDIM subsampling scheme [0...samples),
+        or number of steps in an optimization process.
+        """
+        return self._total_steps
+
+    @property
+    def latent(self):
+        """
+        The latent denormalized ready for decoding with channels last.
+        """
+        return self._latent
+
+    @property
+    def normalized_latent(self):
+        """
+        The latent normalized with channels first.
+        """
+        return self._normalized_latent
+
+    @property
+    def pass_index(self):
+        """
+        The current pass during optimization. -1 represents the initial unconditional sampling
+        """
+        return self._pass_index
+
+    @property
+    def subpass(self):
+        """
+        The current sub-pass during optimization.
+        'dps' - sampling
+        'opt' - optimizing
+        'ref' - refining
+        """
+        return self._subpass
+
+    def volume(self, resolution: int = 128):
+        """
+        Decodes the latent as a clean volume (0...1)
+        """
+        with torch.no_grad():
+            return self._pipeline.clean_volume(self._pipeline.decode_latent(self._latent, resolution=resolution))
+
+
+class Recorder:
+    def __init__(self, pipeline: 'Pipeline'):
+        self.__pipeline = pipeline
+        self.__environments = []
+        self.__latents = []
+        self.__volumes = []
+        self.__captures = []
+        self.__frames = []
+        environment = 0.4 * torch.ones(64, 128, 3, device='cuda')
+        # environment[:, :, 0] = (59 / 255) ** 2.2
+        # environment[:, :, 1] = (94 / 255) ** 2.2
+        # environment[:, :, 2] = (134 / 255) ** 2.2
+        environment[32:] *= 0.2
+        environment[12, 0] = 2500
+        self.add_environment(environment) # adds a default environment
+        self.__default_environment_objects = rendering.environment_objects(environment)
+
+    @property
+    def num_frames(self):
+        return len(self.__frames)
+
+    def equal_tensors(self, t1, t2):
+        return t1.shape == t2.shape and torch.equal(t1, t2)
+
+    def _resolve_environment(self, environment):
+        environment = environment.detach().clone().cpu()
+        if len(self.__environments) == 0 or not self.equal_tensors(self.__environments[-1], environment):
+            self.__environments.append(environment)
+        return len(self.__environments) - 1
+
+    def _resolve_latent(self, latent):
+        latent = latent.detach().clone().cpu()
+        if len(self.__latents) == 0 or not self.equal_tensors(self.__latents[-1], latent):
+            self.__latents.append(latent)
+        return len(self.__latents) - 1
+
+    def _resolve_volume(self, volume):
+        volume = volume.detach().clone().cpu()
+        if len(self.__volumes) == 0 or not self.equal_tensors(self.__volumes[-1], volume):
+            self.__volumes.append(volume)
+        return len(self.__volumes) - 1
+
+    def add_environment(self, environment: torch.Tensor):
+        self.__environments.append(environment.detach().clone().cpu())
+        return len(self.__environments) - 1
+
+    def add_latent(self, latent: torch.Tensor):
+        self.__latents.append(latent.detach().clone().cpu())
+        return len(self.__latents) - 1
+
+    def add_volume(self, volume: torch.Tensor):
+        self.__volumes.append(volume.detach().clone().cpu())
+        return len(self.__volumes) - 1
+
+    def add_capture_latent(self,
+                    latent: typing.Union[torch.Tensor, int],
+                    environment: typing.Union[torch.Tensor, int] = 0,
+                    density_scale: float = 300,
+                    scattering_albedo: typing.Tuple[float, float, float] = (0.99, 0.98, 0.94),
+                    phase_g: float = 0.0,
+                    camera_position: typing.Tuple[float, float, float] = (np.cos(0.5) * 2.7, np.sin(0.5), np.sin(0.5) * 2.7),
+                    samples: int = 1,
+                    render_mode: typing.Literal['tr', 'ms', 'msw'] = 'msw'
+                    ):
+        if isinstance(latent, torch.Tensor):
+            latent = self._resolve_latent(latent)
+        if isinstance(environment, torch.Tensor):
+            environment = self._resolve_environment(environment)
+        self.__captures.append(dict(
+            capture_mode='latent',
+            index=latent,
+            density_scale=density_scale,
+            environment_index=environment,
+            scattering_albedo=scattering_albedo,
+            phase_g=phase_g,
+            camera_position=camera_position,
+            samples=samples,
+            render_mode=render_mode
+        ))
+        return len(self.__captures) - 1
+
+    def add_capture_volume(self,
+                    volume: typing.Union[torch.Tensor, int],
+                    environment: typing.Union[torch.Tensor, int] = 0,
+                    density_scale: float = 300,
+                    scattering_albedo: typing.Tuple[float, float, float] = (0.99, 0.98, 0.94),
+                    phase_g: float = 0.0,
+                    camera_position: typing.Tuple[float, float, float] = (np.cos(0.5) * 2.7, np.sin(0.5), np.sin(0.5) * 2.7),
+                    samples: int = 1,
+                    render_mode: typing.Literal['tr', 'ms', 'msw'] = 'msw'
+                    ):
+        if isinstance(volume, torch.Tensor):
+            volume = self._resolve_volume(volume)
+        if isinstance(environment, torch.Tensor):
+            environment = self._resolve_environment(environment)
+        self.__captures.append(dict(
+            capture_mode='volume',
+            index=volume,
+            density_scale=density_scale,
+            environment_index=environment,
+            scattering_albedo=scattering_albedo,
+            phase_g=phase_g,
+            camera_position=camera_position,
+            samples=samples,
+            render_mode=render_mode
+        ))
+        return len(self.__captures) - 1
+
+    def add_capture_image(self, rendered_image: torch.Tensor):
+        self.__captures.append(dict(
+            capture_mode='image',
+            image=rendered_image
+        ))
+        return len(self.__captures) - 1
+
+    def new_keyframe(self, *capture_indices):
+        self.__frames.append(list(capture_indices))
+
+    def save(self, file_name: str):
+        torch.save({
+            'captures': self.__captures,
+            'frames': self.__frames,
+            'environments': self.__environments,
+            'latents': self.__latents,
+        }, file_name)
+
+    def load(self, file_name: str):
+        data = torch.load(file_name)
+        self.__latents = data['latents']
+        self.__frames = data['frames']
+        self.__captures = data['captures']
+        self.__environments = data['environments']
+
+    def _create_environment_objects(self, *ids):
+        environments = {}
+        for env_id in ids:
+            if env_id in environments:
+                continue
+            env, env_sampler = rendering.environment_objects(self.__environments[env_id].to(self.__pipeline.get_device()))
+            environments[env_id] = (env, env_sampler)
+        return environments
+
+    def _render_grid_ms(self,
+        grid: torch.Tensor,
+        density_scale: float,
+        scattering_albedo,
+        phase_g,
+        environment,
+        environment_sampler,
+        camera_position,
+        width: int,
+        height: int,
+        samples: int
+    ):
+        return rendering.accumulate(lambda: rendering.scattered(
+                    grid * density_scale,
+                    camera_poses=rendering.camera_poses(camera_position),
+                    scattering_albedo=scattering_albedo,
+                    environment=environment,
+                    phase_g=phase_g,
+                    majorant=grid.max() * density_scale,
+                    environment_sampler=environment_sampler,
+                    width=width,
+                    height=height,
+                    jittered=samples > 16,
+                    samples=min(32, samples)
+                ), times=max(1, samples // 32))[0]
+
+    def _render_grid_msw(self,
+        grid: torch.Tensor,
+        density_scale: float,
+        scattering_albedo,
+        phase_g,
+        environment,
+        environment_sampler,
+        camera_position,
+        width: int,
+        height: int,
+        samples: int
+    ):
+        T = rendering.transmittance(grid*density_scale,
+                                    camera_poses=rendering.camera_poses(camera_position),
+                                    width=width, height=height, samples=1, jittered=False
+                                    )[0]
+        return T + (1 - T) * rendering.accumulate(lambda: rendering.scattered(
+                    grid * density_scale,
+                    camera_poses=rendering.camera_poses(camera_position),
+                    scattering_albedo=scattering_albedo,
+                    environment=rdv.ONE,
+                    phase_g=phase_g,
+                    majorant=grid.max() * density_scale,
+                    environment_sampler=environment_sampler,
+                    width=width,
+                    height=height,
+                    jittered=samples > 16,
+                    samples=min(32, samples)
+                ), times=max(1, samples // 32))[0]
+
+
+    def render_image(self,
+                     grid: typing.Union[int, torch.Tensor],
+                     environment: typing.Union[int, torch.Tensor] = 0,
+                     density_scale: float = 300,
+                     scattering_albedo: typing.Tuple[float, float, float] = (0.99, 0.98, 0.94),
+                     phase_g: float = 0.0,
+                     camera_position: typing.Tuple[float, float, float] = (
+                     np.cos(0.5) * 2.7, np.sin(0.5), np.sin(0.5) * 2.7),
+                     width: int = 512,
+                     height: int = 512,
+                     samples: int = 32,
+                     render_mode: typing.Literal['tr', 'ms', 'msw'] = 'msw'
+    ):
+        if isinstance(grid, int):
+            grid = self.__volumes[grid]
+        if isinstance(environment, int):
+            environment = self.__environments[environment]
+        if environment is self.__environments[0]:
+            environment, environment_sampler = self.__default_environment_objects
+        else:
+            environment, environment_sampler = rendering.environment_objects(environment)
+        if render_mode == 'ms':
+            return self._render_grid_ms(grid, density_scale, scattering_albedo, phase_g, environment, environment_sampler, camera_position, width, height, samples)
+        if render_mode == 'msw':
+            return self._render_grid_msw(grid, density_scale, scattering_albedo, phase_g, environment,
+                                        environment_sampler, camera_position, width, height, samples)
+        raise NotImplementedError()
+
+
+    def render_captures(self, *ids, width: int = 512, height: int = 512, samples_multiplier: int = 1, max_samples: int = 4096):
+        device = self.__pipeline.get_device()
+        captures = {}
+        env_ids = [self.__captures[i]['environment_index'] for i in ids if self.__captures[i]['capture_mode'] != 'image']
+        environment_objects = self._create_environment_objects(*env_ids)
+        prev_grid = None
+        prev_grid_index = -1
+        prev_grid_source = ''
+        ids = set(ids)
+        for cap_id in tqdm(ids, "Rendering captures"):
+            c = self.__captures[cap_id]
+            if c['capture_mode'] == 'image':
+                im = modeling.resampling(c['image'].unsqueeze(0), (height, width), align_corners=False)[0]
+            else:
+                if prev_grid_source != c['capture_mode'] or prev_grid_index != c['index']:
+                    prev_grid_index = c['index']
+                    prev_grid_source = c['capture_mode']
+                    if prev_grid_source == 'latent':
+                        latent = self.__latents[prev_grid_index]
+                        prev_grid = self.__pipeline.decode_latent(latent.to(device))
+                        prev_grid = self.__pipeline.clean_volume(prev_grid)
+                    else:  # explicit volume
+                        prev_grid = self.__volumes[prev_grid_index]
+                grid = prev_grid
+                env, env_sampler = environment_objects[c['environment_index']]
+                samples = min(c['samples'] * samples_multiplier, max_samples)
+                if c['render_mode'] == 'ms':
+                    im = self._render_grid_ms(
+                        grid, c['density_scale'], c['scattering_albedo'], c['phase_g'],
+                        env, env_sampler, c['camera_position'],
+                        width, height, samples
+                    )
+                elif c['render_mode'] == 'msw':
+                    im = self._render_grid_msw(
+                        grid, c['density_scale'], c['scattering_albedo'], c['phase_g'],
+                        env, env_sampler, c['camera_position'],
+                        width, height, samples
+                    )
+                else:
+                    raise NotImplementedError()
+            captures[cap_id] = torch.flip(im.cpu(), dims=[0])
+        return captures
+
+    def render_frames(self, *ids, width: int = 512, height: int = 512, samples_multiplier: int = 1, max_samples: int = 4096):
+        cap_ids = []
+        for i in ids:
+            for c in self.__frames[i]:
+                cap_ids.append(c)
+        cap_ids = set(cap_ids)
+        captured_images = self.render_captures(
+            *cap_ids,
+            width=width,
+            height=height,
+            samples_multiplier=samples_multiplier,
+            max_samples=max_samples
+        )
+        frames = torch.zeros(len(ids), height, width, 3)
+        for i, id in enumerate(ids):
+            captures = self.__frames[id]
+            if len(captures) == 1:
+                frames[i] = captured_images[captures[0]]
+            elif len(captures) == 2:
+                h = height // 4
+                c0 = captured_images[captures[0]][h:3 * h]
+                c1 = captured_images[captures[1]][h:-h]
+                frames[i][2 * h:] = c1
+                frames[i][:2 * h] = c0
+            elif len(captures) == 3:
+                h = height // 3
+                c0 = captured_images[captures[0]][height//2 - h//2:height//2+h-(h//2)]
+                frames[i][:h] = c0
+                c1 = captured_images[captures[1]][height//2 - h//2:height//2+h-(h//2)]
+                frames[i][h:2*h] = c1
+                h = height - 2 * h
+                c2 = captured_images[captures[2]][height//2 - h//2:height//2+h-(h//2)]
+                frames[i][-h:] = c2
+
+        return frames
+
+    def save_video(self,
+                     file_name: str,
+                     width: int = 512,
+                     height: int = 512,
+                     samples_multiplier: int = 1,
+                     max_samples: int = 4096):
+        frames = self.render_frames(
+            *list(range(len(self.__frames))),
+            width=width,
+            height=height,
+            samples_multiplier=samples_multiplier,
+            max_samples=max_samples)
+        rendering.save_video(frames, file_name)
+
+    def show_clip(self,
+                  cols: int,
+                  rows: int = 1,
+                  width: int = 512,
+                  height: int = 512,
+                  samples_multiplier: int = 1,
+                  frame_border: bool = False
+                  ):
+        num_frames = cols * rows
+        if num_frames == 0:
+            return
+        if num_frames == 1:
+            ids = [self.num_frames - 1]
+        else:
+            ids = (np.arange(0.0, 1.00000001, 1.0/(num_frames-1)) * (self.num_frames - 1)).astype(np.int32)
+        fig, axes = plt.subplots(rows, cols, figsize=(cols * width/height, rows), dpi=height)
+        frames = self.render_frames(*ids,
+                        width=width,
+                        height=height,
+                        samples_multiplier=samples_multiplier)
+        for i, f in enumerate(frames):
+            a = axes if num_frames == 1 else (axes[i] if rows == 1 else axes[i//cols, i%cols])
+            a.imshow(torch.clamp(f ** (1.0/2.2), 0.0, 1.0))
+            if frame_border:
+                a.get_xaxis().set_ticks([])
+                a.get_yaxis().set_ticks([])
+            else:
+                a.axis('off')
+        fig.tight_layout(pad=0.0)
+        fig.show()
+
+
 class Pipeline:
     def __init__(self, workplace: str, **settings):
         self.workplace = workplace
@@ -288,6 +816,9 @@ class Pipeline:
                 # latent_tv=1e-3
             )
         )
+
+    def create_recorder(self):
+        return Recorder(self)
 
     def get_latent_shape(self):
         if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
@@ -379,6 +910,12 @@ class Pipeline:
         self.decoding[1].eval()
         return self.decoding  # this is a tuple decoder, upsampler, checkpoint_index
 
+    def get_latent_decoder(self, cp = None):
+        if not hasattr(self, 'latent_decoding'):
+            decoder, upsampler, _ = self.get_decoder(cp)
+            self.latent_decoding = LatentDecoder(upsampler, decoder)
+        return self.latent_decoding
+
     def get_diffuser(self, cp: typing.Optional[int] = None, use_ema: bool = True):
         if not hasattr(self, 'diffuser'):
             # Create decoder and upsampler models
@@ -421,6 +958,8 @@ class Pipeline:
         ids = torch.load(output_path + "/batch_used.pt", weights_only=True)
         # get decoder
         decoder, upsampler, cp = self.get_decoder()
+        decoder.train()
+        upsampler.train()
         cp_every = settings['cp_every']
         # create latents
         if rep_mode == RepresentationModes.monoplanar_128_32:
@@ -522,7 +1061,7 @@ class Pipeline:
                         # tl = tl.squeeze(-1).squeeze(0)
                         if rep_mode == RepresentationModes.monoplanar_128_32:
                             inf_values = eval_monoplanar_128x32(
-                                tx * x_scaler, tl, upsampler, decoder
+                                tx * x_scaler, upsampler(tl.unsqueeze(0))[0], decoder
                             )
                         else:
                             raise NotImplementedError()
@@ -576,6 +1115,8 @@ class Pipeline:
         ids = torch.load(output_path + "/batch_used.pt", weights_only=True)
         # get decoder
         decoder, upsampler, cp = self.get_decoder()
+        decoder.train()
+        upsampler.train()
         cp_every = settings['cp_every']
         # create latents
         if rep_mode == RepresentationModes.monoplanar_128_32:
@@ -672,7 +1213,7 @@ class Pipeline:
                     # tl = tl.squeeze(-1).squeeze(0)
                     if rep_mode == RepresentationModes.monoplanar_128_32:
                         inf_values = eval_monoplanar_128x32(
-                            tx * x_scaler, tl, upsampler, decoder
+                            tx * x_scaler, upsampler(tl.unsqueeze(0))[0], decoder
                         )
                     else:
                         raise NotImplementedError()
@@ -768,7 +1309,7 @@ class Pipeline:
                 ref_values = rep(x)
             if rep_mode == RepresentationModes.monoplanar_128_32:
                 inf_values = eval_monoplanar_128x32(
-                    x * x_scaler, latent, upsampler, decoder
+                    x * x_scaler, upsampler(latent.unsqueeze(0))[0], decoder
                 )
             else:
                 raise NotImplementedError()
@@ -824,7 +1365,7 @@ class Pipeline:
                 ref_values = rep(x)
             if rep_mode == RepresentationModes.monoplanar_128_32:
                 inf_values = eval_monoplanar_128x32(
-                    x * x_scaler, latent, upsampler, decoder
+                    x * x_scaler, upsampler(latent.unsqueeze(0))[0], decoder
                 )
             loss_mse = torch.nn.functional.mse_loss(inf_values, ref_values, reduction='sum')
             loss_l1 = torch.nn.functional.l1_loss(inf_values, ref_values, reduction='sum')
@@ -1034,7 +1575,7 @@ class Pipeline:
 
         parallel_diffuser = torch.nn.DataParallel(diffuser)
 
-        ema_diffuser = EMA(diffuser, decay=0.99)
+        ema_diffuser = modeling.EMA(diffuser, decay=0.99)
 
         cp_every = settings['cp_every']
         start_step = cp * cp_every
@@ -1142,14 +1683,15 @@ class Pipeline:
     def from_latent_to_rep(self, latent: torch.Tensor):
         decoder, upsampler, cp = self.get_decoder()
         if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
+
             def rep(x):
+                up_latent = upsampler(latent.unsqueeze(0))[0]
                 x_scaler = torch.tensor([1.0, 2.0, 1.0],
                                         device=self.get_device())  # Used to map -0.5...0.5 in y to full range -1.0...1.0 in the rep
 
                 return eval_monoplanar_128x32(
                     x * x_scaler.view(*([1]*(len(x.shape)-1)), 3),
-                    latent,
-                    upsampler,
+                    up_latent,
                     decoder
                 )
         else:
@@ -1166,7 +1708,9 @@ class Pipeline:
         return modeling.reconstruct_grid3d(
             rep,
             ymin=-0.5, ymax=0.5,
-            step_size=2.0/(resolution-1),
+            resx = resolution,
+            resy = resolution // 2,
+            resz = resolution,
             noise=noise,
             device=self.get_device())
 
@@ -1179,6 +1723,19 @@ class Pipeline:
             resolution=resolution,
             noise=noise
         )
+
+    def decode_latent(self, latent: torch.Tensor,
+                      resolution: int = 128,
+                      noise: float = 0.0,
+                      batch_size : typing.Optional[int] = 128*64*128
+                      ):
+        latent_decoding = self.get_latent_decoder()
+        return latent_decoding(latent,
+                               resx=resolution,
+                               resy=resolution//2,
+                               resz=resolution,
+                               noise=noise,
+                               batch_size=batch_size)
 
     def normalize_latent(self, latent: torch.Tensor):
         stats = self.get_normalization_stats()
@@ -1220,7 +1777,7 @@ class Pipeline:
                 noise: torch.Tensor,
                 steps: typing.List[int], *,
                 eta: float = 1.0,
-                callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
                 ):
         """
         Denoises the initial noise (assumed at step steps[0]) transitioning from steps[i] to steps[i+1] using DDIM sampling method.
@@ -1244,28 +1801,39 @@ class Pipeline:
         if len(steps) <= 1:  # nothing to do
             return noise
         diffuser, _ = self.get_diffuser()
+        diffuser.eval()
         with torch.no_grad():
             if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
                 if len(noise.shape) == 3:  # no batch
-                    # return diffuser.eval_generator(noise.unsqueeze(0), t)[0]
-                    def wrap_callback(i, l):
-                        callback(i, l[0])
+                    # return diffuser.eval_generator_ddim(noise.unsqueeze(0), diffuser.timesteps)[0]
+                    def wrap_callback(step, total_steps, timestep, l):
+                        callback(CallbackInfo(
+                            self,
+                            step,
+                            total_steps,
+                            timestep,
+                            l[0], True))
                     return diffuser.reverse_diffusion_DDIM(
                         noise.unsqueeze(0), steps=steps, eta=eta, callback=wrap_callback if callback is not None else None)[0]
                 if len(noise.shape) == 4:  # batch
-                    # return diffuser.eval_generator(noise, t)
-                    return diffuser.reverse_diffusion_DDIM(noise, steps=steps, eta=eta, callback=callback)
+                    def wrap_callback(step, total_steps, timestep, l):
+                        callback(CallbackInfo(self, step, total_steps, timestep, l, True))
+                    # return diffuser.eval_generator_ddim(noise, diffuser.timesteps)
+                    return diffuser.reverse_diffusion_DDIM(noise, steps=steps, eta=eta, callback=wrap_callback if callback is not None else None)
                 raise Exception()
             else:
                 raise NotImplemented()
 
     def posterior_sample(self,
                          noise: torch.Tensor,
-                         steps: typing.List[int], *,
+                         steps: typing.List[int],
+                         y: torch.Tensor,
+                         A: typing.Callable[[torch.Tensor], torch.Tensor],
+                         *,
                          eta: float = 1.0,
-                         criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
-                         criteria_scale: float = 1.0,
-                         callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                         weight: float = 1.0,
+                         ema_factor: float = 1.0,
+                         callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
                          ):
         if len(steps) <= 1:  # nothing to do
             return noise
@@ -1274,20 +1842,23 @@ class Pipeline:
         diffuser.eval()
         with torch.no_grad():
             if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
-                def wrap_callback(i, l):
-                    callback(i, l[0])
+                def wrap_callback(step, total_steps, timestep, l):
+                    callback(CallbackInfo(self, step, total_steps, timestep, l[0], True))
                 return diffuser.posterior_sampling_DPS_DDIM(
                     noise,
                     steps,
+                    y=y,
+                    A=A,
                     eta=eta,
-                    criteria=criteria,
-                    weight=criteria_scale,
+                    weight=weight,
+                    ema_factor=ema_factor,
                     callback=wrap_callback if callback is not None else None)[0]
             else:
                 raise NotImplemented()
 
     def diffuse(self, latent: torch.Tensor, t: int, steps: int, *, noise: typing.Optional[torch.Tensor] = None):
         diffuser, _ = self.get_diffuser()
+        diffuser.eval()
         if self.settings['representation_mode'] == RepresentationModes.monoplanar_128_32:
             if len(latent.shape) == 3:  # no batch
                 return diffuser.forward_diffusion(latent.unsqueeze(0), t, steps, noise=noise)[0]
@@ -1297,23 +1868,26 @@ class Pipeline:
         else:
             raise NotImplemented()
 
-    def generate_normalized_latent(self,
+    def sample_normalized_latent(self,
                                    start_noise: typing.Optional[torch.Tensor] = None,
                                    start_step: typing.Optional[int] = None, *,
                                    samples: int = 1000,
                                    scheduler_gamma: float = 0.5,
                                    eta: float = 1.0,
-                                   criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
-                                   criteria_scale: float = 1.0,
-                                   callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                                   y: typing.Optional[torch.Tensor] = None,
+                                   A: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                                   guiding_strength: float = 1.0,
+                                   ema_factor: float = 1.0,
+                                   callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
                                    ):
         """
-        Generates a normalized latent from the diffuser.
+        Generates a normalized latent from the diffuser, x~p(x) or x~p(x|y) if y is provided.
         Parameters
         ----------
         start_noise: torch.Tensor | None
             The initial noise. If None, a proper gaussian noise is used.
             If the shape is BxFxRxR, the batch size B is used to generate a batch of latents instead of a single latent.
+            Posterior sampling does not support batches.
         start_step: int | None
             If start_noise is not None, this is the corresponding step index. If None, the step T (timesteps) is assumed.
         samples: int
@@ -1322,9 +1896,16 @@ class Pipeline:
             gamma value used for the scheduler of the steps.
         eta: float
             eta parameter for the DDIM sampling. eta = 0 is solely determined by x_T, eta=1 is equivalent to DDPM.
-        criteria: typing.Callable[[torch.Tensor], torch.Tensor] | None
-            If criteria is provided, the gradient is used to guide the posterior sampling towards an optimization goal.
-            The latent for the gradient computation is provided (denormalized).
+        y: torch.Tensor
+            Measurement as sampling condition p(x|y) assuming a forward model exists: y = A(x) + gaussian_noise
+            If measurement y is provided, the gradient of A is used to guide the posterior sampling towards an optimization goal.
+        A: typing.Callable[[torch.Tensor], torch.Tensor] | None
+            Represents the function emulating the measurement.
+            The latent for the gradient computation is provided (normalized).
+            Default (None) case is assumed the identity y = x.
+        guiding_strength: float
+            Scaler for the gradient guiding the posterior sampling.
+            0 will represent an unconditional sampling. Recommended 1. Greater than 1 could overshoot and create artifacts.
         callback:
             If callback is provided, the estimated latent for each denoising step it is sent to the function with the step index.
 
@@ -1346,22 +1927,24 @@ class Pipeline:
         >>> masked_reference = mask * reference_cloud
         >>> latent = pipeline.generate_normalized_latent(samples=50, criteria=lambda l: (pipeline.from_latent_to_grid(pipeline.denormalize_latent(l)) * mask - masked_reference)**2)
         """
-        assert criteria is not None or start_noise is None or len(start_noise) == 3, \
+        if A is None:
+            A = lambda l: l
+        assert y is None or start_noise is None or len(start_noise.shape) == 3, \
             "Posterior sampling is not supported for batch generation. Generate a single latent at a time."
         assert start_step is None or start_noise is not None, \
             "start_step requires a existing noise state to be provided."
         if start_noise is None:
             start_noise = self.random_gaussian_latent()
         diffuser, _ = self.get_diffuser()
-        diffuser.eval()
         if start_step is None:
             start_step = diffuser.timesteps
         x = np.arange(0.0, 1.00001, 1.0/samples)
         x = x ** scheduler_gamma  # scheduler
         x = (x * start_step).astype(np.int32)
         steps = list(x)
+        steps[1] = (steps[0] + steps[2])//2
         steps.reverse()
-        if criteria is None:
+        if y is None:
             return self.denoise(
                 start_noise,
                 steps=steps,
@@ -1372,30 +1955,35 @@ class Pipeline:
             return self.posterior_sample(
                 start_noise,
                 steps=steps,
+                y=y,
+                A=A,
                 eta=eta,
-                criteria=criteria,
-                criteria_scale=criteria_scale,
+                weight=guiding_strength,
+                ema_factor=ema_factor,
                 callback=callback
             )
 
-    def generate_latent(self,
+    def sample_latent(self,
                         start_noise: typing.Optional[torch.Tensor] = None,
                         start_step: typing.Optional[int] = None,
                         *,
-                        samples: int = 1000,
+                        samples: int = 200,
                         scheduler_gamma: float = 0.5,
                         eta: float = 1.0,
-                        criteria: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
-                        criteria_scale: float = 1.0,
-                        callback: typing.Optional[typing.Callable[[int, torch.Tensor], None]] = None
+                        y: typing.Optional[torch.Tensor] = None,
+                        A: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                        guiding_strength: float = 1.0,
+                        ema_factor: float = 1.0,
+                        callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
         ):
         """
-        Generates a latent from the diffuser.
+        Generates a latent from the diffuser, x~p(x) or x~p(x|y) if y is provided.
         Parameters
         ----------
         start_noise: torch.Tensor | None
             The initial noise. If None, a proper gaussian noise is used.
             If the shape is BxRxRxF, the batch size B is used to generate a batch of latents instead of a single latent.
+            Posterior sampling does not support batches.
         start_step: int | None
             If start_noise is not None, this is the corresponding step index. If None, the step T (timesteps) is assumed.
         samples: int
@@ -1404,9 +1992,16 @@ class Pipeline:
             gamma value used for the scheduler of the steps.
         eta: float
             eta parameter for the DDIM sampling. eta = 0 is solely determined by x_T, eta=1 is equivalent to DDPM.
-        criteria: typing.Callable[[torch.Tensor], torch.Tensor] | None
-            If criteria is provided, the gradient is used to guide the posterior sampling towards an optimization goal.
+        y: torch.Tensor
+            Measurement as sampling condition p(x|y) assuming a forward model exists: y = A(x) + gaussian_noise
+            If measurement y is provided, the gradient of A is used to guide the posterior sampling towards an optimization goal.
+        A: typing.Callable[[torch.Tensor], torch.Tensor] | None
+            Represents the function emulating the measurement.
             The latent for the gradient computation is provided (denormalized).
+            Default (None) case is assumed the identity y = x.
+        guiding_strength: float
+            Scaler for the gradient guiding the posterior sampling.
+            0 will represent an unconditional sampling. Recommended 1. Greater than 1 could overshoot and create artifacts.
         callback:
             If callback is provided, the estimated latent for each denoising step it is sent to the function with the step index.
 
@@ -1426,26 +2021,190 @@ class Pipeline:
         >>> # load reference cloud
         >>> mask = ...., reference_cloud = ...
         >>> masked_reference = mask * reference_cloud
-        >>> latent = pipeline.generate_latent(samples=50, criteria=lambda l: (pipeline.from_latent_to_grid(l) * mask - masked_reference)**2)
+        >>> latent = pipeline.generate_latent(samples=50, y=masked_reference, A=lambda l: pipeline.from_latent_to_grid(l) * mask)
         """
-        assert criteria is not None or start_noise is None or len(start_noise) == 3, \
+        assert y is None or start_noise is None or len(start_noise.shape) == 3, \
             "Posterior sampling is not supported for batch generation. Generate a single latent at a time."
 
-        def wrap_callback(i, l):
-            callback(i, self.denormalize_latent(l))
+        if y is not None and A is None:
+            A = lambda x0hat: x0hat
 
-        def wrap_criteria(l):
-            return criteria(self.denormalize_latent(l))
+        def wrap_A(l):
+            return A(self.denormalize_latent(l))
 
-        latent = self.generate_normalized_latent(
+        latent = self.sample_normalized_latent(
             start_noise=start_noise,
             start_step=start_step,
             samples=samples,
             scheduler_gamma=scheduler_gamma,
             eta=eta,
-            criteria=wrap_criteria if criteria is not None else None,
-            criteria_scale=criteria_scale,
-            callback=wrap_callback if callback is not None else None
+            y = y,
+            A = wrap_A if A is not None else None,
+            guiding_strength=guiding_strength,
+            ema_factor=ema_factor,
+            callback=callback
         )
         return self.denormalize_latent(latent)
+
+    def sample_volume(self,
+                    resolution: int = 128,
+                    start_noise: typing.Optional[torch.Tensor] = None,
+                    start_step: typing.Optional[int] = None,
+                    samples: int = 200,
+                    scheduler_gamma: float = 1.0,
+                    *,
+                    y: typing.Optional[torch.Tensor] = None,
+                    A: typing.Optional[typing.Callable[[torch.Tensor],torch.Tensor]] = None,
+                    guiding_strength: float = 1.0,
+                    ema_factor: float = 1.0,
+                    decoding_resolution: int = 128,
+                    decoding_noise: float = 0.0,
+                    out_latent: typing.Optional[torch.Tensor] = None,
+                    callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
+        ):
+        def wrap_A(latent):
+            g = self.decode_latent(latent, decoding_resolution, decoding_noise)
+            g = g * (g > 0.003).float()
+            return A(g)
+        latent = self.sample_latent(
+            start_noise=start_noise,
+            start_step=start_step,
+            samples=samples,
+            scheduler_gamma=scheduler_gamma,
+            y=y, A=None if A is None else wrap_A,
+            guiding_strength=guiding_strength,
+            ema_factor=ema_factor,
+            callback=callback)
+        if out_latent is not None:
+            out_latent.copy_(latent)
+        if resolution <= 0:
+            return None
+
+        g = self.decode_latent(latent, resolution)
+        g = self.clean_volume(g)
+        return g
+
+    def clean_volume(self, g: torch.Tensor):
+        return g * (g > 0.003).float() * (g < 0.9).float()
+
+    def reconstruct_volume(self,
+            y: torch.Tensor,
+            A_factory: typing.Callable[[int], typing.Callable[[torch.Tensor], torch.Tensor]],
+            L_factory: typing.Optional[typing.Callable[[int, torch.Tensor, torch.Tensor], typing.Callable[[], torch.Tensor]]] = None,
+            optimizer: typing.Optional[torch.optim.Optimizer] = None,
+            resolution: int = 128,
+            samples: int = 100,
+            scheduler_gamma: float = 0.8,
+            weights: typing.Optional[typing.Union[float, typing.List[float]]] = None,
+            ema_factor: float = 1.0,
+            decoding_resolution: typing.Union[int, typing.List[int]] = 128,
+            decoding_noise: typing.Union[float, typing.List[float]] = 0.0,
+            optimization_steps: typing.Union[int, typing.List[int]] = 100,
+            optimization_passes: int = 10,
+            out_latent: typing.Optional[torch.Tensor] = None,
+            callback: typing.Optional[typing.Callable[[CallbackInfo], None]] = None
+    ):
+        assert (L_factory is None) == (optimizer is None)
+        if isinstance(weights, float):
+            weights = [weights] * optimization_passes
+        if isinstance(decoding_resolution, int):
+            decoding_resolution = [decoding_resolution]*optimization_passes
+        if isinstance(decoding_noise, float):
+            decoding_noise = [decoding_noise] * optimization_passes
+
+        current_pass = -1
+        current_subpass = 'dps'
+
+        def wrap_callback(ci: CallbackInfo):
+            return callback(CallbackInfo(
+                self,
+                ci.step,
+                ci.total_steps,
+                ci.sampled_timestep,
+                ci.latent,
+                normalized=False,
+                pass_index=current_pass,
+                subpass=current_subpass
+            ))
+
+        def optimize_parameters(p: int, l: torch.Tensor):
+            with torch.no_grad():
+                g = self.decode_latent(l, resolution=resolution)
+                g = self.clean_volume(g)
+            L = L_factory(p, g, y)
+            iterations = tqdm(range(optimization_steps), desc="Opt")
+            for s in iterations:
+                optimizer.zero_grad()
+                loss = L()
+                loss.backward()
+                optimizer.step()
+                iterations.set_postfix_str(f"Loss: {loss.item()}")
+                if callback is not None:
+                    callback(CallbackInfo(self, s, optimization_steps, 0, l, False, pass_index=current_pass, subpass='opt'))
+
+        def refine(A, l: torch.Tensor, decoding_resolution: int, decoding_noise: float):
+            l.requires_grad_(True)
+            opt = torch.optim.NAdam([l], lr=0.0005)
+            y_ema = None
+            iterations = tqdm(range(optimization_steps // 10), "Refinement")
+            for s in iterations:
+                opt.zero_grad()
+                g = self.decode_latent(l, decoding_resolution, decoding_noise)
+                g = self.clean_volume(g)
+                y_hat = A(g)
+                if y_ema is None or ema_factor == 1.0:
+                    y_ema = y_hat
+                else:
+                    y_ema = modeling.ema_diff(y_hat, y_ema, ema_factor)
+                loss = ((y - y_ema)**2).sum()
+                # loss += regularizer_latent_l1(l) * 0.001
+                loss += regularizer_monoplanar_latent_tv(l) * 0.1
+                loss.backward()
+                opt.step()
+                y_ema = y_ema.detach()
+                iterations.set_postfix_str(f"Loss: {loss.item()}")
+                if callback is not None:
+                    callback(CallbackInfo(self, s, optimization_steps // 4,0, l.detach(), False, pass_index=current_pass, subpass='opt'))
+            l.requires_grad_(False)
+
+        diffuser,_ = self.get_diffuser()
+        start_timesteps = [diffuser.timesteps - int(0.5 * diffuser.timesteps * (i / (optimization_passes - 1)) ** 2.0) for i
+                           in range(optimization_passes)]
+        # Start from an unconditional generated volume
+        latent = self.sample_latent(
+            samples=samples,
+            scheduler_gamma=scheduler_gamma,
+            callback=wrap_callback if callback is not None else None
+        )
+
+        for p, start_t in enumerate(start_timesteps):
+            if optimizer is not None:
+                optimize_parameters(p, latent)  # optimize phi
+            # back to noise
+            noise = self.diffuse(self.normalize_latent(latent), 0, start_t)
+            # sample p(x|y)
+            A = A_factory(p)
+            self.sample_volume(
+                start_noise=noise,
+                start_step=start_t,
+                samples=samples,
+                resolution=0,  # no need for volume
+                y=y,
+                A=A,
+                decoding_resolution=decoding_resolution[p],
+                decoding_noise=decoding_noise[p],
+                guiding_strength=weights[p],
+                ema_factor=ema_factor,
+                out_latent=latent,
+                callback=wrap_callback if callback is not None else None
+            )
+            # refine x wrt L
+            if p >= optimization_passes//3 and p < optimization_passes - 2:
+                refine(A, latent,
+                       decoding_resolution=decoding_resolution[p],
+                       decoding_noise=decoding_noise[p])
+        if out_latent is not None:
+            out_latent.copy_(latent)
+        return self.decode_latent(latent, resolution=resolution)
+
 
