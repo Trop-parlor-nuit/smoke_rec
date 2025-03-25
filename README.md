@@ -82,5 +82,19 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 </td>
 </tr>
 
-
 </table>
+
+## Citation
+
+```bibtex
+@article{leonard2025light,
+  title={Light Transport-aware Diffusion Posterior Sampling for Single-View Reconstruction of 3D Volumes},
+  author={Leonard, Ludwic and Thuerey, Nils and Westermann, Ruediger},
+  journal={arXiv preprint arXiv:2501.05226},
+  year={2025}
+}
+```
+
+## Dataset
+
+[Cloudy dataset available at Huggingface](https://huggingface.co/datasets/rendervous-project/cloudy)
