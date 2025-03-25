@@ -8,11 +8,75 @@
 </td>
 <td>
 <h1> Cloudy </h1>
-Official implementation of the paper "Light Transport-aware Diffusion Posterior Sampling for Single View Reconstruction of Volumes"
+"Light Transport-aware Diffusion Posterior Sampling for Single View Reconstruction of Volumes"
 </td>
 </tr>
 </table>
 
+## Paper
+
+Official implementation of the paper 
+
+*Light Transport-aware Diffusion Posterior Sampling for Single View Reconstruction of Volumes*
+
+[Ludwic Leonard](), [Nils Thuerey](), [Ruediger Westermann]()
+
+Technical University of Munich
+
+Accepted to **CVPR 2025**
+
+> **Abstract**<br/>
+> <small>
+> We introduce a single-view reconstruction technique of volumetric fields in which multiple light scattering effects are omnipresent, such as in clouds. We model the unknown distribution of volumetric fields using an unconditional diffusion model trained on a novel benchmark dataset comprising 1,000 synthetically simulated volumetric density fields. The neural diffusion model is trained on the latent codes of a novel, diffusion-friendly, monoplanar representation. The generative model is used to incorporate a tailored parametric diffusion posterior sampling technique into different reconstruction tasks. A physically-based differentiable volume renderer is employed to provide gradients with respect to light transport in the latent space. This stands in contrast to classic NeRF approaches and makes the reconstructions better aligned with observed data. Through various experiments, we demonstrate single-view reconstruction of volumetric clouds at a previously unattainable quality. 
+> </small>
+
+Read from [arXiv](https://arxiv.org/abs/2501.05226).
+
+### Citation
+
+```bibtex
+@article{leonard2025light,
+  title={Light Transport-aware Diffusion Posterior Sampling for Single-View Reconstruction of 3D Volumes},
+  author={Leonard, Ludwic and Thuerey, Nils and Westermann, Ruediger},
+  journal={arXiv preprint arXiv:2501.05226},
+  year={2025}
+}
+```
+
+### Dataset
+
+The dataset comprising 1400 physically based synthetic clouds, can be downloaded from [Cloudy on Hugging Face](https://huggingface.co/datasets/rendervous-project/cloudy).
+
+### Setup
+
+The project requires Vulkan 1.3.
+
+```shell
+sudo apt-get update -y
+sudo apt-get install -y libnvidia-gl-555 vulkan-tools glslang-tools vulkan-validationlayers-dev
+```
+
+Installing from the repository:
+
+```shell
+pip install git+https://github.com/rendervous/cloudy_project.git
+```
+
+### Example
+```python
+import cloudy
+
+# Creates a pipeline bound to a path used to save intermediate data and models
+pipeline = cloudy.create_pipeline('./my_workspace')
+# Download a cached pretrained state and some test clouds in latent form.
+pipeline.download_pretrained()
+# Generates a cloud with shape (128, 64, 128, 1)
+cloud = pipeline.sample_volume()
+# Create a recorder object (Helper class for rendering and video creation)
+recorder = pipeline.create_recorder()
+# Render the cloud, gets an image (512, 512, 3)
+im = recorder.render_image(cloud, samples=64)
+```
 
 ## Led by Example
 
@@ -84,17 +148,4 @@ Official implementation of the paper "Light Transport-aware Diffusion Posterior 
 
 </table>
 
-## Citation
 
-```bibtex
-@article{leonard2025light,
-  title={Light Transport-aware Diffusion Posterior Sampling for Single-View Reconstruction of 3D Volumes},
-  author={Leonard, Ludwic and Thuerey, Nils and Westermann, Ruediger},
-  journal={arXiv preprint arXiv:2501.05226},
-  year={2025}
-}
-```
-
-## Dataset
-
-[Cloudy dataset available at Huggingface](https://huggingface.co/datasets/rendervous-project/cloudy)
