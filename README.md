@@ -35,11 +35,13 @@ Read from [arXiv](https://arxiv.org/abs/2501.05226).
 ### Citation
 
 ```bibtex
-@article{leonard2025light,
-  title={Light Transport-aware Diffusion Posterior Sampling for Single-View Reconstruction of 3D Volumes},
-  author={Leonard, Ludwic and Thuerey, Nils and Westermann, Ruediger},
-  journal={arXiv preprint arXiv:2501.05226},
-  year={2025}
+@InProceedings{Leonard_2025_CVPR,
+    author    = {Leonard, Ludwic and Thurey, Nils and Westermann, R\"udiger},
+    title     = {Light Transport-aware Diffusion Posterior Sampling for Single-View Reconstruction of 3D Volumes},
+    booktitle = {Proceedings of the Computer Vision and Pattern Recognition Conference (CVPR)},
+    month     = {June},
+    year      = {2025},
+    pages     = {16163-16174}
 }
 ```
 
