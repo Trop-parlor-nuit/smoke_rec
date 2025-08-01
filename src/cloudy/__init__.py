@@ -7,6 +7,10 @@ from ._modeling import (
     Volume,
     resampling,
     resample_grid,
+    sample_grid2d,
+    sample_grid2d_batch,
+    sample_grid3d,
+    sample_kplanar,
     total_variation_2D,
     total_variation_3D,
     total_variation_2D_abs,
@@ -24,6 +28,9 @@ from ._rendering import (
     reconstruct_environment,
     background_radiance,
     accumulate,
+    display_postprocess,
+    gamma_correction,
+    log_tone_mapping,
     save_video
 )
 # except Exception as e:

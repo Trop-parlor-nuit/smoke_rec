@@ -753,11 +753,13 @@ class UpsampleConv2D(torch.nn.Sequential):
 
 
 class FeatureUpsampler(torch.nn.Sequential):
-    def __init__(self, in_features: int, out_features: int, activation: typing.Literal['none', 'relu', 'leaky_relu'] = 'none'):
+    def __init__(self, in_features: int, out_features: int, activation: typing.Literal['none', 'relu', 'leaky_relu'] = 'none', batch_norm: bool = False):
         modules = [
             torch.nn.Upsample(scale_factor=2, mode='bicubic', align_corners=True),
             torch.nn.Conv2d(in_features, out_features, 3, 1, 1, dilation=1, padding_mode='replicate')
         ]
+        if batch_norm:
+            modules.append(torch.nn.LazyBatchNorm2d(out_features))
         if activation != 'none':
             if activation=='relu':
                 a = torch.nn.ReLU()
@@ -1571,8 +1573,9 @@ class GaussianDiffuser2D(torch.nn.Module):
         for i in iterations:
             current_i = steps[i] - 1
             next_i = steps[i + 1] - 1
-            alpha_hat = max(0.0001, self.alpha_hat[current_i])
-            alpha_prev_hat = max(0.0001, self.alpha_hat[next_i]) if next_i >= 0 else 1.0
+            delta_steps = current_i - next_i
+            alpha_hat = max(0.0, self.alpha_hat[current_i])
+            alpha_prev_hat = max(0.0, self.alpha_hat[next_i]) if next_i >= 0 else 1.0
             ## Computing x_{t-1} ##
             e = self.predict_noise(x_t, current_i)
             x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
@@ -1581,7 +1584,7 @@ class GaussianDiffuser2D(torch.nn.Module):
             if x0_ema is None: # or current_i > 200:
                 x0_ema = x0_hat
             else:
-                alpha = 0.8 * ((self.timesteps - current_i)/self.timesteps) ** 2 #  * (((current_i + 1)/self.timesteps)**2)
+                alpha = (0.4 ** (delta_steps * 0.25)) * (((self.timesteps - current_i) / self.timesteps) ** 2)
                 torch.add(x0_ema * alpha, other=x0_hat, alpha=1 - alpha, out=x0_ema)
             # x0_hat *= 1.0 / max(1.0, x0_hat.abs().max().item())
             if callback is not None:
@@ -1665,8 +1668,8 @@ class GaussianDiffuser2D(torch.nn.Module):
                 x_t.requires_grad_()
                 e = self.predict_noise(x_t, current_i)
                 # computing x_{t-1}
-                # x0_hat = np.sqrt(1 / max(alpha_hat, 0.00001)) * x_t - np.sqrt(1 / max(alpha_hat, 0.00001) - 1) * e
-                x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
+                x0_hat = np.sqrt(1 / max(alpha_hat, 0.00005)) * x_t - np.sqrt(1 / max(alpha_hat, 0.00005) - 1) * e
+                # x0_hat = np.sqrt(1 / alpha_hat) * x_t - np.sqrt(1 / alpha_hat - 1) * e
                 # x0_hat /= max(1.0, x0_hat.abs().max().item())
                 x0_hat = torch.clamp(x0_hat, -1.0, 1.0)
                 # x0_hat_detach = torch.clamp(x0_hat.detach(), -1.0, 1.0)
@@ -1674,7 +1677,7 @@ class GaussianDiffuser2D(torch.nn.Module):
                 if x0_ema is None:
                     x0_ema = x0_hat_detach
                 else:
-                    alpha = (0.8 ** (delta_steps*0.25)) * (((self.timesteps - current_i) / self.timesteps) ** 2)
+                    alpha = (0.6 ** (delta_steps*0.25)) * (((self.timesteps - current_i) / self.timesteps) ** 2)
                     torch.add(x0_ema * alpha, other=x0_hat_detach, alpha=1 - alpha, out=x0_ema)
                 if callback is not None:
                     callback(i, len(steps) - 1, current_i + 1, x0_ema)

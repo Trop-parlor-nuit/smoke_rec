@@ -387,8 +387,8 @@ class Recorder:
         # environment[:, :, 0] = (59 / 255) ** 2.2
         # environment[:, :, 1] = (94 / 255) ** 2.2
         # environment[:, :, 2] = (134 / 255) ** 2.2
-        environment[32:] *= 0.2
-        environment[12, 0] = 2500
+        environment[:32] *= 0.2
+        environment[52, 0] = 2500
         self.add_environment(environment) # adds a default environment
         self.__default_environment_objects = rendering.environment_objects(environment)
 
@@ -570,8 +570,8 @@ class Recorder:
                     width=width,
                     height=height,
                     jittered=samples > 16,
-                    samples=min(32, samples)
-                ), times=max(1, samples // 32))[0]
+                    samples=min(16, samples)
+                ), times=max(1, samples // 16))[0]
 
 
     def render_image(self,
@@ -603,7 +603,9 @@ class Recorder:
         raise NotImplementedError()
 
 
-    def render_captures(self, *ids, width: int = 512, height: int = 512, samples_multiplier: int = 1, max_samples: int = 4096):
+    def render_captures(self, *ids,
+                        width: int = 512,
+                        height: int = 512, samples_multiplier: int = 1, max_samples: int = 4096):
         device = self.__pipeline.get_device()
         captures = {}
         env_ids = [self.__captures[i]['environment_index'] for i in ids if self.__captures[i]['capture_mode'] != 'image']
@@ -635,12 +637,14 @@ class Recorder:
                         env, env_sampler, c['camera_position'],
                         width, height, samples
                     )
+                    im = rendering.display_postprocess(im)
                 elif c['render_mode'] == 'msw':
                     im = self._render_grid_msw(
                         grid, c['density_scale'], c['scattering_albedo'], c['phase_g'],
                         env, env_sampler, c['camera_position'],
                         width, height, samples
                     )
+                    im = rendering.gamma_correction(im)
                 else:
                     raise NotImplementedError()
             captures[cap_id] = torch.flip(im.cpu(), dims=[0])
@@ -687,14 +691,16 @@ class Recorder:
                      width: int = 512,
                      height: int = 512,
                      samples_multiplier: int = 1,
-                     max_samples: int = 4096):
+                     max_samples: int = 4096,
+                     fps: int = 20
+                   ):
         frames = self.render_frames(
             *list(range(len(self.__frames))),
             width=width,
             height=height,
             samples_multiplier=samples_multiplier,
             max_samples=max_samples)
-        rendering.save_video(frames, file_name)
+        rendering.save_video(frames, file_name, fps=fps)
 
     def show_clip(self,
                   cols: int,
@@ -718,7 +724,7 @@ class Recorder:
                         samples_multiplier=samples_multiplier)
         for i, f in enumerate(frames):
             a = axes if num_frames == 1 else (axes[i] if rows == 1 else axes[i//cols, i%cols])
-            a.imshow(torch.clamp(f ** (1.0/2.2), 0.0, 1.0))
+            a.imshow(f)
             if frame_border:
                 a.get_xaxis().set_ticks([])
                 a.get_yaxis().set_ticks([])
@@ -1812,12 +1818,12 @@ class Pipeline:
                             step,
                             total_steps,
                             timestep,
-                            l[0], True))
+                            l[0], True, subpass='gen'))
                     return diffuser.reverse_diffusion_DDIM(
                         noise.unsqueeze(0), steps=steps, eta=eta, callback=wrap_callback if callback is not None else None)[0]
                 if len(noise.shape) == 4:  # batch
                     def wrap_callback(step, total_steps, timestep, l):
-                        callback(CallbackInfo(self, step, total_steps, timestep, l, True))
+                        callback(CallbackInfo(self, step, total_steps, timestep, l, True, subpass='gen'))
                     # return diffuser.eval_generator_ddim(noise, diffuser.timesteps)
                     return diffuser.reverse_diffusion_DDIM(noise, steps=steps, eta=eta, callback=wrap_callback if callback is not None else None)
                 raise Exception()
@@ -2111,9 +2117,11 @@ class Pipeline:
             decoding_resolution = [decoding_resolution]*optimization_passes
         if isinstance(decoding_noise, float):
             decoding_noise = [decoding_noise] * optimization_passes
+        if isinstance(optimization_steps, int):
+            optimization_steps = [optimization_steps] * optimization_passes
 
         current_pass = -1
-        current_subpass = 'dps'
+        current_subpass = 'gen'
 
         def wrap_callback(ci: CallbackInfo):
             return callback(CallbackInfo(
@@ -2127,7 +2135,7 @@ class Pipeline:
                 subpass=current_subpass
             ))
 
-        def optimize_parameters(p: int, l: torch.Tensor):
+        def optimize_parameters(p: int, l: torch.Tensor, optimization_steps: int):
             with torch.no_grad():
                 g = self.decode_latent(l, resolution=resolution)
                 g = self.clean_volume(g)
@@ -2142,7 +2150,7 @@ class Pipeline:
                 if callback is not None:
                     callback(CallbackInfo(self, s, optimization_steps, 0, l, False, pass_index=current_pass, subpass='opt'))
 
-        def refine(A, l: torch.Tensor, decoding_resolution: int, decoding_noise: float):
+        def refine(A, l: torch.Tensor, decoding_resolution: int, decoding_noise: float, optimization_steps: int):
             l.requires_grad_(True)
             opt = torch.optim.NAdam([l], lr=0.0005)
             y_ema = None
@@ -2164,26 +2172,35 @@ class Pipeline:
                 y_ema = y_ema.detach()
                 iterations.set_postfix_str(f"Loss: {loss.item()}")
                 if callback is not None:
-                    callback(CallbackInfo(self, s, optimization_steps // 4,0, l.detach(), False, pass_index=current_pass, subpass='opt'))
+                    callback(CallbackInfo(self, s, optimization_steps // 10,0, l.detach(), False, pass_index=current_pass, subpass='ref'))
             l.requires_grad_(False)
 
         diffuser,_ = self.get_diffuser()
         start_timesteps = [diffuser.timesteps - int(0.5 * diffuser.timesteps * (i / (optimization_passes - 1)) ** 2.0) for i
                            in range(optimization_passes)]
         # Start from an unconditional generated volume
-        latent = self.sample_latent(
-            samples=samples,
-            scheduler_gamma=scheduler_gamma,
-            callback=wrap_callback if callback is not None else None
-        )
+        current_subpass = 'gen'
+        if optimizer is not None:
+            latent = self.sample_latent(
+                samples=samples,
+                scheduler_gamma=scheduler_gamma,
+                callback=wrap_callback if callback is not None else None
+            )
+        else:
+            latent = torch.zeros(128, 128, 32, device=self.get_device())
 
         for p, start_t in enumerate(start_timesteps):
+            current_pass = p
             if optimizer is not None:
-                optimize_parameters(p, latent)  # optimize phi
+                optimize_parameters(p, latent, optimization_steps[p])  # optimize phi
             # back to noise
-            noise = self.diffuse(self.normalize_latent(latent), 0, start_t)
+            if p > 0:
+                noise = self.diffuse(self.normalize_latent(latent), 0, start_t)
+            else:
+                noise = self.random_gaussian_latent()
             # sample p(x|y)
             A = A_factory(p)
+            current_subpass = 'dps'
             self.sample_volume(
                 start_noise=noise,
                 start_step=start_t,
@@ -2199,10 +2216,12 @@ class Pipeline:
                 callback=wrap_callback if callback is not None else None
             )
             # refine x wrt L
-            if p >= optimization_passes//3 and p < optimization_passes - 2:
-                refine(A, latent,
-                       decoding_resolution=decoding_resolution[p],
-                       decoding_noise=decoding_noise[p])
+            if optimizer is not None:
+                if p >= optimization_passes//3 and p < optimization_passes * 2 // 3:
+                    refine(A, latent,
+                           decoding_resolution=decoding_resolution[p],
+                           decoding_noise=decoding_noise[p],
+                           optimization_steps=optimization_steps[p])
         if out_latent is not None:
             out_latent.copy_(latent)
         return self.decode_latent(latent, resolution=resolution)

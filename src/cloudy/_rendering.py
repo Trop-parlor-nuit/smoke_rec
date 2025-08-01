@@ -74,7 +74,7 @@ def background_radiance(
         **settings
 ):
     """
-    Renders the background radiance from an environment as an xr environment map,
+    Renders the background radiance from an environment as a xr environment map,
     or any callable: directions -> R
     """
     ds = rdv.DependencySet()
@@ -86,16 +86,16 @@ def background_radiance(
                 height=settings.get('height', 512),
                 jittered=settings.get('jittered', False))
     if isinstance(environment, torch.Tensor):  # support xr projection from now
-        sampled_positions = ds.camera.capture(rdv.xr_projection(ray_input=True))
+        sampled_positions = ds.camera.capture(rdv.xr_ray_projection)
         return modeling.sample_grid2d(environment, sampled_positions, align_corners=False)
     else:
-        sampled_directions = ds.camera.capture(rdv.ray_direction())
+        sampled_directions = ds.camera.capture(rdv.ray_direction, batch_size=settings.get('width', 512)*settings.get('height', 512))
         return environment(sampled_directions)
 
 
 def reconstruct_environment(environment_model, *, width: int, height: int):
     """
-    Maps an environment map given by a model to an xr image.
+    Maps an environment map given by a model to a xr image.
     """
     stepw = 2.0 / width
     steph = 2.0 / height
@@ -134,9 +134,8 @@ def transmittance(
                     height=settings.get('height', 512),
                     jittered=settings.get('jittered', False))
         return ds, ds.camera.capture(
-            ds.transmittance,
-            fw_samples=settings.get('samples', 1),
-            batch_size=512*512
+            ds.transmittance, batch_size=settings.get('width', 512)*settings.get('height', 512),
+            fw_samples=settings.get('samples', 1)
         )
 
     return DifferentiableRendering.apply(rendering_process, grid)
@@ -197,7 +196,7 @@ def scattered(
                     width=settings.get('width', 512),
                     height=settings.get('height', 512),
                     jittered=settings.get('jittered', True))
-        return ds, ds.camera.capture(ds.radiance,
+        return ds, ds.camera.capture(ds.radiance, batch_size=settings.get('width', 512)*settings.get('height', 512),
                                      fw_samples=settings.get('samples', 1),
                                      bw_samples=settings.get('samples_bw', 1)
                                      )
@@ -251,13 +250,11 @@ def scattered_environment(
             ds.environment,
             ds.boundary, ds.majorant)
 
-        return ds, ds.camera.capture(map, fw_samples=settings.get('samples', 1), bw_samples=settings.get('bw_samples', 1)) # R = Wout * E(wout)
+        return ds, ds.camera.capture(map, batch_size=settings.get('width', 512)*settings.get('height', 512), fw_samples=settings.get('samples', 1), bw_samples=settings.get('bw_samples', 1)) # R = Wout * E(wout)
     return DifferentiableRendering.apply(rendering_process, environment)
 
 
-def save_video(frames: torch.Tensor, filename: str, fps: int = 20, apply_gamma = True):
-    if apply_gamma:
-        frames = torch.clamp_min(frames, 0.0) ** (1.0 / 2.2)
+def save_video(frames: torch.Tensor, filename: str, fps: int = 20):
     frames = torch.clamp(frames, 0.0, 1.0)
     # rgba = torch.zeros(*frames.shape[:-1], 4)
     # rgba[..., 0:3] = frames
@@ -268,10 +265,60 @@ def save_video(frames: torch.Tensor, filename: str, fps: int = 20, apply_gamma =
     rdv.save_video(frames, filename, fps, **kwargs)
 
 
+
+from tqdm import tqdm
+
 def accumulate(p, times):
     assert times > 0
     with torch.no_grad():
         img = p()
-        for i in range(1, times):
+        for i in tqdm(range(1, times), "Accumulating:"):
             torch.add(img, p(), alpha=1, out=img)
         return img/times
+
+
+def log_tone_mapping(im: torch.Tensor, maximum = None):
+    L = 0.2126 * im[...,0:1] + 0.7152 * im[...,1:2] + 0.0722 * im[...,2:3]
+    im = im / (L + 1e-8)
+    input_shape = im.shape
+    if maximum is None:
+        if len(input_shape) == 3:  # no batch dimension
+            cim = L.unsqueeze(0)
+        else:
+            cim = L
+        cim = cim.permute(0, 3, 1, 2)  # channels first
+        cim = torch.nn.functional.interpolate(cim, scale_factor=0.5, mode='bicubic', align_corners=False)
+        # cim = torch.nn.functional.interpolate(cim, scale_factor=0.5, mode='bicubic', align_corners=False)
+        cim = torch.nn.functional.interpolate(cim, scale_factor=0.5, mode='bicubic', align_corners=False)
+        cim = cim.reshape(cim.shape[0], -1)
+        m = cim.max(dim=1)[0].view(cim.shape[0], 1, 1, 1)
+    else:
+        num_images = 1 if len(input_shape) == 3 else input_shape[0]
+        if isinstance(maximum, torch.Tensor):
+            assert maximum.numel() == num_images
+            m = maximum
+        else:
+            m = torch.tensor([[maximum]]*num_images, device=im.device)
+    if len(input_shape) == 3:
+        m = m[0]
+    L = torch.log(1 + L)/torch.log(1 + m)
+    # L =  L / (1 + L) * (1 + L/(m**2))
+    return im * L
+
+
+def gamma_correction(im: torch.Tensor, gamma: float = 2.2):
+    return im ** (1.0/gamma)
+
+
+def display_postprocess(im: torch.Tensor, *,
+    apply_tone_mapping: bool = True,
+    apply_gamma_correction: bool = True,
+    brightness: float = 1.0):
+    im = im.clamp_min(0.0)
+    im = im * brightness
+    if apply_tone_mapping:
+        im = log_tone_mapping(im)
+    if apply_gamma_correction:
+        im = gamma_correction(im)
+    im = im.clamp(0.0, 1.0)
+    return im
