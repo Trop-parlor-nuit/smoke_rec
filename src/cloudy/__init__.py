@@ -16,7 +16,7 @@ from ._modeling import (
     total_variation_2D_abs,
     gaussian_filter
 )
-
+"""
 # try:
 from ._rendering import (
     camera_poses,
@@ -37,7 +37,7 @@ from ._rendering import (
 #     print(e)
 #     pass
 
-
+"""
 def create_pipeline(workspace: str = '.', **settings) -> Pipeline:
     """
     Creates a pipeline object bound to a specific folder as workspace.

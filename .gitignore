@@ -1,4 +1,7 @@
-/videos/
-/videos/
-/paper/
-/sandbox/
+.venv/
+__pycache__/
+*.pyc
+.env
+.vscode/
+*.blend1
+*.tmp

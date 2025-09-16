@@ -1,0 +1,2 @@
+rendervous@ git+https://github.com/rendervous/rendervous_project.git
+denoising_diffusion_pytorch
